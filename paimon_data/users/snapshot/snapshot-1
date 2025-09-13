@@ -1,0 +1,11 @@
+{
+  "id": 1,
+  "schemaId": 1,
+  "baseManifestList": "manifest/manifest-1",
+  "deltaManifestList": null,
+  "timestampMs": 1757685392764,
+  "summary": {
+    "operation": "append",
+    "paimon.table.uuid": "c1c559c9-1c24-45a5-886f-83aab35149bb"
+  }
+}

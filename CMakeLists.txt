@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.5...3.29)
 
 # Set extension name here
+# Set the primary target name (used for backwards compatibility)
 set(TARGET_NAME iceberg)
 project(${TARGET_NAME})
 
@@ -66,6 +67,12 @@ set(EXTENSION_SOURCES
     src/storage/table_update/common.cpp
     src/storage/iceberg_table_information.cpp
     src/storage/create_table/iceberg_create_table_request.cpp
+    # New table format architecture
+    src/table_format.cpp
+    src/table_format_manager.cpp
+    src/iceberg_table_format.cpp
+    src/paimon_table_format.cpp
+    src/paimon_functions.cpp
 )
 
 add_subdirectory(src/rest_catalog/objects)
@@ -74,6 +81,30 @@ add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
 
 set(PARAMETERS "-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
+
+# Build Paimon extension (Paimon-only, no Iceberg inheritance)
+set(PAIMON_TARGET_NAME paimon)
+set(PAIMON_EXTENSION_SOURCES
+    src/paimon_extension.cpp
+    src/paimon_functions.cpp
+    src/paimon_metadata.cpp
+    src/paimon_predicate.cpp
+    src/paimon_multi_file_reader.cpp
+    src/paimon_multi_file_list.cpp
+    # Shared table format infrastructure
+    src/table_format.cpp
+    src/table_format_manager.cpp
+    src/paimon_table_format.cpp
+    # Paimon write support
+    src/storage/prc_transaction_manager.cpp
+    src/storage/prc_catalog.cpp
+    src/storage/prc_transaction.cpp
+    src/storage/paimon_insert.cpp
+    src/storage/paimon_catalog.cpp
+    src/storage/paimon_schema_entry.cpp
+    src/storage/paimon_table_entry.cpp
+)
+build_loadable_extension(${PAIMON_TARGET_NAME} ${PARAMETERS} ${PAIMON_EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     find_package(CURL REQUIRED)
@@ -98,17 +129,21 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     target_link_libraries(${TARGET_NAME}_loadable_extension
                         ${AWSSDK_LINK_LIBRARIES})
 
-    # Link dependencies into extension
+    # Link dependencies into iceberg extension
     target_link_libraries(${EXTENSION_NAME} PUBLIC ${CURL_LIBRARIES})
     target_link_libraries(${TARGET_NAME}_loadable_extension ${CURL_LIBRARIES})
+
+    # Link dependencies into paimon extension
+    target_link_libraries(${PAIMON_TARGET_NAME}_loadable_extension ${CURL_LIBRARIES})
 endif()
 
 # Link Roaring library
 target_link_libraries(${EXTENSION_NAME} PUBLIC roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
 target_link_libraries(${TARGET_NAME}_loadable_extension roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
+target_link_libraries(${PAIMON_TARGET_NAME}_loadable_extension roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
 
 install(
-  TARGETS ${EXTENSION_NAME} ${TARGET_NAME}_loadable_extension
+  TARGETS ${EXTENSION_NAME} ${TARGET_NAME}_loadable_extension ${PAIMON_TARGET_NAME}_loadable_extension
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

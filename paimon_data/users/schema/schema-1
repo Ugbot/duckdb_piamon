@@ -1,0 +1,30 @@
+{
+  "id": 1,
+  "type": "struct",
+  "fields": [
+    {
+      "id": 1,
+      "name": "id",
+      "type": "int",
+      "nullable": false
+    },
+    {
+      "id": 2,
+      "name": "name",
+      "type": "string",
+      "nullable": false
+    },
+    {
+      "id": 3,
+      "name": "age",
+      "type": "int",
+      "nullable": false
+    },
+    {
+      "id": 4,
+      "name": "city",
+      "type": "string",
+      "nullable": false
+    }
+  ]
+}

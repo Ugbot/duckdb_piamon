@@ -1,9 +1,16 @@
 > **Disclaimer:** This extension is currently in an experimental state. Feel free to try it out, but be aware that things may not work as expected
 
-# DuckDB extension for Apache Iceberg 
+# DuckDB extensions for Lakehouse Formats
 
-This repository contains a DuckDB extension that adds support for [Apache Iceberg](https://iceberg.apache.org/). In its current state, the extension offers some basics features that allow listing snapshots and reading specific snapshots
-of an iceberg tables.
+This repository contains DuckDB extensions that add support for lakehouse table formats:
+
+## Extensions
+
+### Iceberg Extension (`iceberg.duckdb_extension`)
+Provides support for [Apache Iceberg](https://iceberg.apache.org/) tables. This extension offers basic features for listing snapshots and reading specific snapshots of Iceberg tables.
+
+### Paimon Extension (`paimon.duckdb_extension`)
+Provides support for both [Apache Iceberg](https://iceberg.apache.org/) and [Apache Paimon](https://paimon.apache.org/) table formats. This extension can automatically detect and handle both formats based on the table structure.
 
 ## Documentation
 
@@ -25,16 +32,17 @@ based on pyspark 3.5, which you can install through pip.
 
 ### Building the extension
 
-To build the extension with vcpkg, you can build this extension using:
+To build the extensions with vcpkg, you can build using:
 
 ```shell
 VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' make
 ```
 
-This will build both the separate loadable extension and a duckdb binary with the extension pre-loaded:
+This will build both extensions and a duckdb binary with the iceberg extension pre-loaded:
 ```shell
 ./build/release/duckdb
 ./build/release/extension/iceberg/iceberg.duckdb_extension
+./build/release/extension/paimon/paimon.duckdb_extension
 ```
 
 ### Running tests
