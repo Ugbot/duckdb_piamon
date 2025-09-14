@@ -11,6 +11,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -62,6 +64,10 @@ public:
 
     // Physical planning
     PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                 optional_ptr<PhysicalOperator> plan) override;
+    PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                 optional_ptr<PhysicalOperator> plan) override;
+    PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                  optional_ptr<PhysicalOperator> plan) override;
 
     // Transaction management

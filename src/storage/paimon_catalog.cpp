@@ -287,6 +287,48 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
     return insert;
 }
 
+PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                    optional_ptr<PhysicalOperator> plan) {
+    std::cerr << "PAIMON: PlanUpdate called for table: " << op.table.name << std::endl;
+
+    if (!plan) {
+        throw NotImplementedException("UPDATE Paimon tables requires a data source");
+    }
+
+    // Create our PaimonUpdate physical operator
+    // For now, this is a placeholder - full implementation would require complex logic
+    // to read existing data, apply updates, and write new files
+    throw NotImplementedException("UPDATE operations on Paimon tables are not yet fully implemented");
+
+    // Full implementation would look like:
+    // auto &update = planner.Make<PaimonUpdate>(op.types, op.table, op.columns,
+    //     std::move(op.expressions), std::move(op.bound_defaults),
+    //     std::move(op.bound_constraints), op.estimated_cardinality, op.return_chunk);
+    // update.children.push_back(*plan);
+    // return update;
+}
+
+PhysicalOperator &PaimonCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                    optional_ptr<PhysicalOperator> plan) {
+    std::cerr << "PAIMON: PlanDelete called for table: " << op.table.name << std::endl;
+
+    if (!plan) {
+        throw NotImplementedException("DELETE from Paimon tables requires a data source");
+    }
+
+    // Create our PaimonDelete physical operator
+    // For now, this is a placeholder - full implementation would require complex logic
+    // to read existing data and create delete files
+    throw NotImplementedException("DELETE operations on Paimon tables are not yet fully implemented");
+
+    // Full implementation would look like:
+    // auto &delete_op = planner.Make<PaimonDelete>(op.types, op.table,
+    //     std::move(op.expressions), std::move(op.bound_constraints),
+    //     op.estimated_cardinality, op.return_chunk);
+    // delete_op.children.push_back(*plan);
+    // return delete_op;
+}
+
 unique_ptr<TransactionManager> PaimonCatalog::CreateTransactionManager() {
     // Create a basic transaction manager for Paimon
     // For now, we'll use DuckDB's standard transaction manager

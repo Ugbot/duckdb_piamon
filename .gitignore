@@ -1,22 +1,125 @@
-build
-.vscode
-.idea
-cmake-build-debug
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+cmake-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.make
+*.cmake
+
+# DuckDB specific
 duckdb_unittest_tempdir/
-.DS_Store
 testext
-test/python/__pycache__/
-.Rhistory
-test/sql/tmp.test
+*.duckdb
+*.duckdb.wal
+*.duckdb.shm
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pyflink_test/
+.pyflink_test/
+.venv/
+.venv-*/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# JAR files and Java artifacts
+*.jar
+*.war
+*.ear
+*.class
+target/
+paimon-flink-*.jar
+flink-*.tgz
+flink-*/
+
+# Test data and temporary files
+test_real_paimon/
+test_real_paimon_test/
+/tmp/paimon*/
+paimon_data/
+data/generated/*
 data/iceberg/generated_*
+test/sql/tmp.test
 scripts/metastore_db/
 scripts/derby.log
 scripts/test-script-with-path.sql
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.Rhistory
+.RData
+.Rproj
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+logs/
+log/
+tmp/
+temp/
+
+# Documentation artifacts
+*.pdf
+*.doc
+*.docx
+
+# Scripts cache
 scripts/data_generators/__pycache__/
 scripts/data_generators/*/__pycache__/
 scripts/data_generators/*/*/*.parquet
-data/generated/*
 
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
+# Flink specific
+flink-sql-history
+jobmanager.out
+taskmanager.out
+
+# Performance results and reports
+/tmp/paimon_performance_results.json
+docs/

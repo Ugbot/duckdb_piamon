@@ -21,7 +21,7 @@ protected:
 
 public:
 	//! Paimon-specific methods
-	void Bind(vector<LogicalType> &return_types, vector<string> &names);
+	void Bind(vector<LogicalType> &return_types, vector<string> &names, const PaimonOptions &options);
 
 	//! Partition pruning methods
 	unique_ptr<MultiFileList> DynamicFilterPushdown(ClientContext &context, const MultiFileOptions &options,

@@ -71,15 +71,35 @@ struct PaimonOptions {
     } snapshot_lookup;
 };
 
-// Paimon snapshot representation
+// Paimon snapshot representation (Version 3 format - matching Java spec)
 struct PaimonSnapshot {
+    // Core version 3 fields (matching org.apache.paimon.Snapshot)
+    int version = 3;
     uint64_t snapshot_id = 0;
-    uint64_t sequence_number = 0;
-    timestamp_t timestamp_ms;
-    string manifest_list;
-    string schema_id;
+    int64_t schema_id = 0;
     string base_manifest_list;
-    case_insensitive_map_t<string> summary;
+    optional_ptr<int64_t> base_manifest_list_size;  // Size of base manifest list
+    string delta_manifest_list;
+    optional_ptr<int64_t> delta_manifest_list_size;  // Size of delta manifest list
+    optional_ptr<string> changelog_manifest_list;    // Can be null
+    optional_ptr<int64_t> changelog_manifest_list_size;  // Size of changelog manifest list
+    optional_ptr<string> index_manifest;             // Index manifest (can be null)
+    string commit_user;
+    int64_t commit_identifier = 9223372036854775807LL;
+    string commit_kind;
+    timestamp_t time_millis;
+    string log_offsets;
+    optional_ptr<int64_t> total_record_count;        // Can be null
+    optional_ptr<int64_t> delta_record_count;        // Can be null
+    optional_ptr<int64_t> changelog_record_count;    // Can be null
+    optional_ptr<int64_t> watermark;                 // Can be null
+    optional_ptr<string> statistics;                 // Statistics (can be null)
+    optional_ptr<case_insensitive_map_t<string>> properties;  // Additional properties
+    optional_ptr<int64_t> next_row_id;               // Next row ID for assignment
+
+    // Legacy fields for compatibility
+    uint64_t sequence_number = 0;
+    string manifest_list;  // For backward compatibility
 
     PaimonSnapshot() = default;
     PaimonSnapshot(const PaimonSnapshot &) = default;
@@ -120,6 +140,13 @@ struct PaimonSchemaField {
 struct PaimonSchema {
     int id;
     vector<PaimonSchemaField> fields;
+    vector<string> partition_keys;  // Names of partition key columns
+};
+
+// Helper struct for snapshot metadata parsing
+struct SnapshotMetadata {
+    timestamp_t timestamp_ms = 0;
+    uint64_t snapshot_id = 0;
 };
 
 // Paimon table metadata
@@ -128,8 +155,16 @@ public:
     static string GetMetaDataPath(ClientContext &context, const string &table_location, FileSystem &fs,
                                   const PaimonOptions &options);
 
+    static SnapshotMetadata ParseSnapshotMetadata(const string &metadata_path, FileSystem &fs,
+                                                  const string &compression_codec);
+
     static unique_ptr<PaimonTableMetadata> Parse(const string &metadata_path, FileSystem &fs,
                                                  const string &compression_codec);
+
+    // Snapshot lookup methods
+    PaimonSnapshot *FindSnapshotByTimestamp(timestamp_t timestamp);
+    PaimonSnapshot *FindSnapshotById(uint64_t snapshot_id);
+    PaimonSnapshot *GetCurrentSnapshot(const PaimonOptions &options);
 
     // Schema parsing helpers
     static void ParseSchemaFromJson(yyjson_val *schema_obj, PaimonSchema &schema);
@@ -142,6 +177,129 @@ public:
     case_insensitive_map_t<string> properties;
     string table_format_version;
     unique_ptr<PaimonSchema> schema;
+};
+
+// Paimon file format enumeration
+enum class PaimonFileFormat {
+    PARQUET,
+    ORC,
+    AVRO
+};
+
+// File source enumeration (for DataFileMeta)
+enum class FileSource : int8_t {
+    APPEND = 0,
+    COMPACT = 1
+};
+
+// Simple statistics structure for Paimon
+struct SimpleStats {
+    std::vector<std::string> colNames;
+    std::vector<std::vector<Value>> colStats;  // Each column's stats as array of values
+};
+
+// Complete DataFileMeta structure matching Paimon DataFileMeta.SCHEMA (20 fields)
+struct DataFileMeta {
+    // Core file information (fields 0-2)
+    std::string fileName;
+    int64_t fileSize;
+    int64_t rowCount;
+
+    // Key bounds (fields 3-4) - binary encoded
+    std::vector<uint8_t> minKey;
+    std::vector<uint8_t> maxKey;
+
+    // Statistics (fields 5-6)
+    SimpleStats keyStats;
+    SimpleStats valueStats;
+
+    // Sequence numbers (fields 7-8)
+    int64_t minSequenceNumber;
+    int64_t maxSequenceNumber;
+
+    // Schema and level (fields 9-10)
+    int64_t schemaId;
+    int level;
+
+    // Additional files (field 11)
+    std::vector<std::string> extraFiles;
+
+    // Timestamps (field 12)
+    timestamp_t creationTime;
+
+    // Delete information (field 13) - nullable
+    optional_ptr<int64_t> deleteRowCount;
+
+    // Index information (field 14) - nullable
+    optional_ptr<std::vector<uint8_t>> embeddedFileIndex;
+
+    // Source tracking (field 15) - nullable
+    optional_ptr<FileSource> fileSource;
+
+    // Column information (fields 16-19)
+    std::vector<std::string> valueStatsCols;
+    optional_ptr<std::string> externalPath;
+    optional_ptr<int64_t> firstRowId;
+    optional_ptr<std::vector<std::string>> writeCols;
+
+    // Constructor with defaults
+    DataFileMeta() :
+        fileSize(0), rowCount(0), minSequenceNumber(0), maxSequenceNumber(0),
+        schemaId(0), level(0), creationTime(Timestamp::GetCurrentTimestamp()) {}
+};
+
+// BucketManager for deterministic bucket assignment
+class BucketManager {
+private:
+    int numBuckets;
+    std::hash<std::string> hasher;
+
+public:
+    BucketManager(int numBuckets);
+
+    // Bucket assignment methods
+    int assignBucket(const std::string& key) const;
+    int assignBucket(const std::vector<Value>& partitionValues, const Value& primaryKey) const;
+
+    // Utility methods
+    int getNumBuckets() const { return numBuckets; }
+    std::vector<int> getAllBuckets() const;
+};
+
+// FileStorePathFactory for Paimon-compliant path management
+class FileStorePathFactory {
+private:
+    std::string tablePath;
+    int numBuckets;
+
+public:
+    FileStorePathFactory(const std::string& tablePath, int numBuckets = 1);
+
+    // Bucket-based paths
+    std::string bucketPath(int bucket) const;
+    std::string dataFilePath(int bucket, const std::string& uuid, int counter, PaimonFileFormat format) const;
+    std::string deleteFilePath(int bucket, const std::string& uuid, int counter, PaimonFileFormat format) const;
+
+    // Manifest paths (always Avro)
+    std::string manifestFilePath(const std::string& uuid, int index) const;
+    std::string manifestListFilePath(const std::string& uuid, int index) const;
+
+    // Snapshot paths
+    std::string snapshotFilePath(int64_t snapshotId) const;
+    std::string earliestPointerPath() const;
+    std::string latestPointerPath() const;
+
+    // Partitioned paths
+    std::string partitionBucketPath(const std::vector<std::pair<std::string, std::string>>& partition, int bucket) const;
+    std::string partitionedDataFilePath(const std::vector<std::pair<std::string, std::string>>& partition, int bucket,
+                                       const std::string& uuid, int counter, PaimonFileFormat format) const;
+    std::string partitionedDeleteFilePath(const std::vector<std::pair<std::string, std::string>>& partition, int bucket,
+                                         const std::string& uuid, int counter, PaimonFileFormat format) const;
+
+    // Utility methods
+    int getNumBuckets() const { return numBuckets; }
+    std::string getTablePath() const { return tablePath; }
+    std::string getFormatExtension(PaimonFileFormat format) const;
 };
 
 } // namespace duckdb

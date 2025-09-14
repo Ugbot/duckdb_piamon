@@ -47,12 +47,11 @@ PaimonMultiFileList::PaimonMultiFileList(ClientContext &context, const string &p
     : MultiFileList(vector<OpenFileInfo> {}, FileGlobOptions::ALLOW_EMPTY), context(context), path(path), files(files) {
 }
 
-void PaimonMultiFileList::Bind(vector<LogicalType> &return_types, vector<string> &names) {
+void PaimonMultiFileList::Bind(vector<LogicalType> &return_types, vector<string> &names, const PaimonOptions &options) {
 	// Try to load Paimon metadata for schema
 	try {
 		if (!metadata) {
 			FileSystem &fs = FileSystem::GetFileSystem(context);
-			PaimonOptions options; // Use default options for now
 			auto paimon_meta_path = PaimonTableMetadata::GetMetaDataPath(context, path, fs, options);
 			metadata = PaimonTableMetadata::Parse(paimon_meta_path, fs, options.metadata_compression_codec);
 		}

@@ -1,0 +1,12 @@
+[project]
+name = "paimon-test-rig"
+version = "0.1.0"
+description = "Test rig for DuckDB Paimon extension using PyFlink"
+requires-python = ">=3.11"
+dependencies = [
+    "apache-flink>=1.18.1",
+    "pyflink>=1.0",
+]
+
+[tool.uv]
+dev-dependencies = []

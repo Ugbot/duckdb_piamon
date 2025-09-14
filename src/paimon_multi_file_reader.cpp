@@ -38,8 +38,8 @@ bool PaimonMultiFileReader::Bind(MultiFileOptions &options, MultiFileList &files
     std::cerr << "PAIMON: MultiFileReader::Bind called" << std::endl;
     auto &paimon_multi_file_list = dynamic_cast<PaimonMultiFileList &>(files);
 
-    // Bind the schema from Paimon metadata
-    paimon_multi_file_list.Bind(return_types, names);
+    // Bind the schema from Paimon metadata using the correct options
+    paimon_multi_file_list.Bind(return_types, names, paimon_options);
     std::cerr << "PAIMON: Bind set " << return_types.size() << " return types and " << names.size() << " names" << std::endl;
 
     // Determine the file format from the files
@@ -132,10 +132,18 @@ bool PaimonMultiFileReader::ParseOption(const string &key, const Value &val, Mul
         // TODO: Store in PaimonOptions
         return true;
     } else if (loption == "snapshot_from_timestamp") {
-        // TODO: Store in PaimonOptions
+        if (options.snapshot_lookup.snapshot_source != PaimonOptions::SnapshotLookup::SnapshotSource::LATEST) {
+            throw InvalidInputException("Can't use 'snapshot_from_id' in combination with 'snapshot_from_timestamp'");
+        }
+        options.snapshot_lookup.snapshot_source = PaimonOptions::SnapshotLookup::SnapshotSource::FROM_TIMESTAMP;
+        options.snapshot_lookup.snapshot_timestamp = val.GetValue<timestamp_t>();
         return true;
     } else if (loption == "snapshot_from_id") {
-        // TODO: Store in PaimonOptions
+        if (options.snapshot_lookup.snapshot_source != PaimonOptions::SnapshotLookup::SnapshotSource::LATEST) {
+            throw InvalidInputException("Can't use 'snapshot_from_id' in combination with 'snapshot_from_timestamp'");
+        }
+        options.snapshot_lookup.snapshot_source = PaimonOptions::SnapshotLookup::SnapshotSource::FROM_ID;
+        options.snapshot_lookup.snapshot_id = val.GetValue<uint64_t>();
         return true;
     }
 

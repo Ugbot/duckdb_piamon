@@ -100,6 +100,8 @@ set(PAIMON_EXTENSION_SOURCES
     src/storage/prc_catalog.cpp
     src/storage/prc_transaction.cpp
     src/storage/paimon_insert.cpp
+    src/storage/paimon_update.cpp
+    src/storage/paimon_delete.cpp
     src/storage/paimon_catalog.cpp
     src/storage/paimon_schema_entry.cpp
     src/storage/paimon_table_entry.cpp
