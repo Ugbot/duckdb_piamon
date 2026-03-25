@@ -100,6 +100,100 @@ LogicalType PaimonTypeToLogicalType(const PaimonDataType &paimon_type) {
 }
 
 //===--------------------------------------------------------------------===//
+// Enum to_string Functions
+//===--------------------------------------------------------------------===//
+
+string PaimonTypeRootToString(PaimonTypeRoot type_root) {
+	switch (type_root) {
+	case PaimonTypeRoot::STRING:
+		return "STRING";
+	case PaimonTypeRoot::BOOLEAN:
+		return "BOOLEAN";
+	case PaimonTypeRoot::INT:
+		return "INT";
+	case PaimonTypeRoot::LONG:
+		return "BIGINT";
+	case PaimonTypeRoot::FLOAT:
+		return "FLOAT";
+	case PaimonTypeRoot::DOUBLE:
+		return "DOUBLE";
+	case PaimonTypeRoot::TIMESTAMP:
+		return "TIMESTAMP";
+	case PaimonTypeRoot::DATE:
+		return "DATE";
+	case PaimonTypeRoot::BINARY:
+		return "BYTES";
+	case PaimonTypeRoot::DECIMAL:
+		return "DECIMAL";
+	case PaimonTypeRoot::ARRAY:
+		return "ARRAY";
+	case PaimonTypeRoot::MAP:
+		return "MAP";
+	case PaimonTypeRoot::STRUCT:
+		return "ROW";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+string PaimonFileFormatToString(PaimonFileFormat format) {
+	switch (format) {
+	case PaimonFileFormat::PARQUET:
+		return "parquet";
+	case PaimonFileFormat::ORC:
+		return "orc";
+	case PaimonFileFormat::AVRO:
+		return "avro";
+	default:
+		return "unknown";
+	}
+}
+
+string FileSourceToString(FileSource source) {
+	switch (source) {
+	case FileSource::APPEND:
+		return "APPEND";
+	case FileSource::COMPACT:
+		return "COMPACT";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+string PaimonDataType::ToString() const {
+	switch (type_root) {
+	case PaimonTypeRoot::DECIMAL:
+		if (precision > 0) {
+			return "DECIMAL(" + std::to_string(precision) + ", " + std::to_string(scale >= 0 ? scale : 0) + ")";
+		}
+		return "DECIMAL(38, 18)";
+	case PaimonTypeRoot::ARRAY:
+		if (element_type) {
+			return "ARRAY<" + element_type->ToString() + ">";
+		}
+		return "ARRAY<STRING>";
+	case PaimonTypeRoot::MAP:
+		if (key_type && value_type) {
+			return "MAP<" + key_type->ToString() + ", " + value_type->ToString() + ">";
+		}
+		return "MAP<STRING, STRING>";
+	case PaimonTypeRoot::STRUCT: {
+		string result = "ROW<";
+		for (idx_t i = 0; i < fields.size(); i++) {
+			if (i > 0) {
+				result += ", ";
+			}
+			result += fields[i].name + " " + fields[i].type.ToString();
+		}
+		result += ">";
+		return result;
+	}
+	default:
+		return PaimonTypeRootToString(type_root);
+	}
+}
+
+//===--------------------------------------------------------------------===//
 // Schema Parsing
 //===--------------------------------------------------------------------===//
 
