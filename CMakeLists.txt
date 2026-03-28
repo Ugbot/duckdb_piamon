@@ -91,17 +91,10 @@ set(PAIMON_EXTENSION_SOURCES
     src/paimon_predicate.cpp
     src/paimon_multi_file_reader.cpp
     src/paimon_multi_file_list.cpp
-    # Shared table format infrastructure
-    src/table_format.cpp
-    src/table_format_manager.cpp
-    src/paimon_table_format.cpp
-    # Paimon write support
-    src/storage/prc_transaction_manager.cpp
-    src/storage/prc_catalog.cpp
-    src/storage/prc_transaction.cpp
-    src/storage/paimon_insert.cpp
-    src/storage/paimon_update.cpp
-    src/storage/paimon_delete.cpp
+    src/paimon_manifest.cpp
+    # Shared utilities (IcebergUtils::FileToString, GetStorageLocation, etc.)
+    src/common/utils.cpp
+    # Paimon storage/catalog
     src/storage/paimon_catalog.cpp
     src/storage/paimon_schema_entry.cpp
     src/storage/paimon_table_entry.cpp

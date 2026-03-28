@@ -37,6 +37,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		throw MissingExtensionException("The paimon extension requires the parquet extension to be loaded!");
 	}
 
+	ExtensionHelper::AutoLoadExtension(instance, "avro");
+	if (!instance.ExtensionIsLoaded("avro")) {
+		throw MissingExtensionException("The paimon extension requires the avro extension to be loaded!");
+	}
+
 	auto &config = DBConfig::GetConfig(instance);
 
 	config.AddExtensionOption("unsafe_enable_version_guessing",
