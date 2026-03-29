@@ -37,10 +37,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		throw MissingExtensionException("The paimon extension requires the parquet extension to be loaded!");
 	}
 
-	ExtensionHelper::AutoLoadExtension(instance, "avro");
-	if (!instance.ExtensionIsLoaded("avro")) {
-		throw MissingExtensionException("The paimon extension requires the avro extension to be loaded!");
-	}
+	// Avro extension is needed for reading Paimon manifest files (Avro format).
+	// It will be loaded on-demand when manifest reading is attempted.
+	// Without it, we fall back to directory scanning for file discovery.
 
 	auto &config = DBConfig::GetConfig(instance);
 

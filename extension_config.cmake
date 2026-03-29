@@ -1,17 +1,19 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
-# Avro disabled - our Paimon extension doesn't need it
+# Avro extension provides read_avro() needed by both iceberg (manifests) and paimon (manifests).
+# Requires VCPKG build with duckdb/duckdb-avro-c custom fork.
+# Build with: make release VCPKG_BUILD=1
 # duckdb_extension_load(avro
 # 		LOAD_TESTS
 # 		GIT_URL https://github.com/duckdb/duckdb-avro
 # 		GIT_TAG 0c97a61781f63f8c5444cf3e0c6881ecbaa9fe13
 # )
 
-# Extension from this repo - temporarily disabled to test Paimon only
-# duckdb_extension_load(iceberg
-#     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-#     LOAD_TESTS
-#     LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/*.a"
-# )
+# Extension from this repo - needed to process CMakeLists.txt which defines paimon target
+duckdb_extension_load(iceberg
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
+    LOAD_TESTS
+    LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/*.a"
+)
 
 duckdb_extension_load(tpch)
 duckdb_extension_load(icu)
