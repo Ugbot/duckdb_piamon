@@ -23,12 +23,17 @@ public:
 	//! Paimon-specific methods
 	void Bind(vector<LogicalType> &return_types, vector<string> &names, const PaimonOptions &options);
 
-	//! Partition pruning methods
+	//! Partition pruning
 	unique_ptr<MultiFileList> DynamicFilterPushdown(ClientContext &context, const MultiFileOptions &options,
-	                                                 const vector<string> &names, const vector<LogicalType> &types,
-	                                                 const vector<column_t> &column_ids, TableFilterSet &filters) const;
+	                                                const vector<string> &names, const vector<LogicalType> &types,
+	                                                const vector<column_t> &column_ids,
+	                                                TableFilterSet &filters) const override;
 
 private:
+	//! File discovery methods
+	void DiscoverDataFiles();
+	void DiscoverFilesFromBucketDirs(const string &base_dir, FileSystem &fs);
+
 	//! Helper methods for partition pruning
 	string ExtractPartitionValueFromPath(const string &file_path, const string &column_name) const;
 	bool PartitionValueMatchesFilter(const string &partition_value, const LogicalType &type,
