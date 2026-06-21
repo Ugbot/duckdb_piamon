@@ -26,5 +26,15 @@ data_large: data data_clean
 data_clean:
 	rm -rf data/generated
 
+# Generate native Apache Paimon fixtures via pypaimon (used by test/sql/local/paimon_*.test).
+# Run tests with DUCKDB_PAIMON_HAVE_GENERATED_DATA=1 after this.
+paimon-fixtures-venv:
+	python3.12 -m venv .paimon-fixtures-venv
+	.paimon-fixtures-venv/bin/pip install --quiet --upgrade pip
+	.paimon-fixtures-venv/bin/pip install --quiet pypaimon==1.4.1 requests
+
+paimon_data: paimon-fixtures-venv
+	.paimon-fixtures-venv/bin/python scripts/data_generators/generate_paimon_fixtures.py
+
 wasm_pre_build_step:
 	jq 'del(.overrides,.dependencies[5])' vcpkg.json | unexpand -t2 > vcpkg.json.tmp && mv vcpkg.json.tmp vcpkg.json

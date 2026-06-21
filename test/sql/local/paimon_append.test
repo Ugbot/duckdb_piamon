@@ -1,0 +1,68 @@
+# name: test/sql/local/paimon_append.test
+# group: [local]
+#
+# Reads native Apache Paimon 1.4.x tables produced by pypaimon
+# (scripts/data_generators/generate_paimon_fixtures.py, seed=42).
+# Generate with: .paimon-fixtures-venv/bin/python scripts/data_generators/generate_paimon_fixtures.py
+
+require avro
+
+require parquet
+
+require-env DUCKDB_PAIMON_HAVE_GENERATED_DATA
+
+# paimon is built as a separate loadable extension (not linked into the test binary), so load it
+# explicitly from the in-tree build rather than via `require paimon`.
+statement ok
+LOAD '__WORKING_DIRECTORY__/build/release/extension/iceberg/paimon.duckdb_extension';
+
+# --- Append-only, unaware bucket: exact row count + values via manifest-driven discovery ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_simple');
+----
+20
+
+query III
+SELECT id, name, round(score, 3) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_simple') ORDER BY id LIMIT 3;
+----
+0	udaxihhe	59.641
+1	xdvxrcsn	38.477
+2	bacghqta	59.589
+
+# --- Partitioned append: total + per-partition counts ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned');
+----
+50
+
+query TI
+SELECT dt, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') GROUP BY dt ORDER BY dt;
+----
+2024-01-01	17
+2024-01-02	17
+2024-01-03	16
+
+# --- Metadata introspection ---
+query I
+SELECT primary_keys FROM paimon_metadata('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup');
+----
+id
+
+# --- Catalog ATTACH + catalog-integrated scan ---
+statement ok
+ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);
+
+query I
+SELECT count(*) FROM pm.append_simple;
+----
+20
+
+query TI
+SELECT dt, count(*) FROM pm.append_partitioned GROUP BY dt ORDER BY dt;
+----
+2024-01-01	17
+2024-01-02	17
+2024-01-03	16
+
+statement ok
+DETACH pm;

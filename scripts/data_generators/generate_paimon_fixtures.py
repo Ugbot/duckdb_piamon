@@ -20,6 +20,10 @@ import string
 import pyarrow as pa
 from pypaimon import CatalogFactory, Schema
 
+# Deterministic fixtures: randomized *values* (per the project's no-hardcoded-data rule) but a
+# fixed seed and fixed row counts so sqllogictest assertions are reproducible.
+random.seed(42)
+
 
 def rand_str(n=8):
     return "".join(random.choice(string.ascii_lowercase) for _ in range(n))
@@ -51,7 +55,7 @@ def gen_append(catalog, db):
     )
     catalog.create_table(f"{db}.append_simple", schema, False)
     table = catalog.get_table(f"{db}.append_simple")
-    n = random.randint(20, 40)
+    n = 20
     batch = pa.record_batch({
         "id": pa.array(list(range(n)), pa.int64()),
         "name": pa.array([rand_str() for _ in range(n)], pa.string()),
@@ -74,10 +78,10 @@ def gen_partitioned(catalog, db):
     )
     catalog.create_table(f"{db}.append_partitioned", schema, False)
     table = catalog.get_table(f"{db}.append_partitioned")
-    rows, parts = [], ["2024-01-01", "2024-01-02", "2024-01-03"]
-    n = random.randint(30, 60)
+    parts = ["2024-01-01", "2024-01-02", "2024-01-03"]
+    n = 50
     ids = list(range(n))
-    dts = [random.choice(parts) for _ in range(n)]
+    dts = [parts[i % len(parts)] for i in range(n)]  # deterministic partition assignment
     vals = [random.randint(0, 1000) for _ in range(n)]
     batch = pa.record_batch({
         "id": pa.array(ids, pa.int64()),
