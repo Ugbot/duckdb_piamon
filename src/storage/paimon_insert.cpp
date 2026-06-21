@@ -489,22 +489,25 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	snapshot_json += "  \"watermark\": -9223372036854775808\n";
 	snapshot_json += "}";
 
+	// The snapshot file is the atomic commit point: FILE_CREATE_NEW fails if another writer already
+	// committed this id, so two concurrent commits can't clobber each other.
 	string snapshot_path = path_factory.snapshotFilePath(next_snapshot_id);
 	{
 		auto handle = fs.OpenFile(snapshot_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 		handle->Write((void *)snapshot_json.c_str(), snapshot_json.size());
 	}
 
-	// Step 5: Update LATEST pointer. Paimon hint files hold the bare snapshot id ("1"), not the
-	// file name — this is what Flink/Spark/pypaimon expect.
-	{
-		string latest_content = std::to_string(next_snapshot_id);
-		if (fs.FileExists(latest_file)) {
-			fs.RemoveFile(latest_file);
+	// Step 5: Update the LATEST hint atomically (write a temp file, then rename over it) so a reader
+	// never observes a partially written pointer. Paimon hint files hold the bare snapshot id.
+	auto write_hint_atomic = [&](const string &hint_path, const string &content) {
+		string tmp_path = hint_path + ".tmp-" + UUID::ToString(UUID::GenerateRandomUUID());
+		{
+			auto handle = fs.OpenFile(tmp_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+			handle->Write((void *)content.c_str(), content.size());
 		}
-		auto handle = fs.OpenFile(latest_file, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
-		handle->Write((void *)latest_content.c_str(), latest_content.size());
-	}
+		fs.MoveFile(tmp_path, hint_path); // rename is atomic on a local filesystem
+	};
+	write_hint_atomic(latest_file, std::to_string(next_snapshot_id));
 
 	// EARLIEST always points at the oldest retained snapshot; (re)write it to the bare id.
 	string earliest_file = table_path + "/snapshot/EARLIEST";
