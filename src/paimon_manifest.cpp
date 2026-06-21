@@ -1,5 +1,5 @@
 #include "paimon_manifest.hpp"
-#include "paimon_avro_scan.hpp"
+#include "paimon_avro_reader.hpp"
 #include "paimon_binary_row.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -28,11 +28,10 @@ static idx_t FindColumn(const vector<string> &names, const string &target) {
 vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, const string &manifest_list_path) {
 	vector<PaimonManifestFileMeta> result;
 
-	// Read the Avro file natively via the read_avro table function (no nested SQL — see PaimonAvroScan).
-	PaimonAvroScan scan("paimon_manifest_list", context, manifest_list_path);
-	auto &names = scan.GetNames();
+	// Read the manifest-list Avro file with the native reader (no read_avro; supports zstandard).
+	PaimonAvroReader reader(context, manifest_list_path);
+	auto &names = reader.GetNames();
 
-	// Map column names to indices
 	idx_t file_name_idx = FindColumn(names, "_FILE_NAME");
 	idx_t file_size_idx = FindColumn(names, "_FILE_SIZE");
 	idx_t num_added_idx = FindColumn(names, "_NUM_ADDED_FILES");
@@ -43,46 +42,22 @@ vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, co
 		throw IOException("Paimon manifest list missing required column _FILE_NAME");
 	}
 
-	// Fetch all chunks
-	DataChunk chunk_storage;
-	scan.InitializeChunk(chunk_storage);
-	while (true) {
-		chunk_storage.Reset();
-		if (!scan.GetNext(chunk_storage)) {
-			break;
+	for (idx_t row = 0; row < reader.RowCount(); row++) {
+		PaimonManifestFileMeta meta;
+		meta.file_name = reader.GetValue(row, file_name_idx).ToString();
+		if (file_size_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, file_size_idx).IsNull()) {
+			meta.file_size = reader.GetValue(row, file_size_idx).GetValue<int64_t>();
 		}
-		DataChunk *chunk = &chunk_storage;
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			PaimonManifestFileMeta meta;
-			meta.file_name = chunk->GetValue(file_name_idx, row).ToString();
-
-			if (file_size_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(file_size_idx, row);
-				if (!val.IsNull()) {
-					meta.file_size = val.GetValue<int64_t>();
-				}
-			}
-			if (num_added_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(num_added_idx, row);
-				if (!val.IsNull()) {
-					meta.num_added_files = val.GetValue<int64_t>();
-				}
-			}
-			if (num_deleted_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(num_deleted_idx, row);
-				if (!val.IsNull()) {
-					meta.num_deleted_files = val.GetValue<int64_t>();
-				}
-			}
-			if (schema_id_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(schema_id_idx, row);
-				if (!val.IsNull()) {
-					meta.schema_id = val.GetValue<int64_t>();
-				}
-			}
-
-			result.push_back(std::move(meta));
+		if (num_added_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, num_added_idx).IsNull()) {
+			meta.num_added_files = reader.GetValue(row, num_added_idx).GetValue<int64_t>();
 		}
+		if (num_deleted_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, num_deleted_idx).IsNull()) {
+			meta.num_deleted_files = reader.GetValue(row, num_deleted_idx).GetValue<int64_t>();
+		}
+		if (schema_id_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, schema_id_idx).IsNull()) {
+			meta.schema_id = reader.GetValue(row, schema_id_idx).GetValue<int64_t>();
+		}
+		result.push_back(std::move(meta));
 	}
 
 	return result;
@@ -95,11 +70,10 @@ vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, co
 vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context, const string &manifest_file_path) {
 	vector<PaimonManifestEntryParsed> result;
 
-	// Read the Avro file natively via the read_avro table function (no nested SQL — see PaimonAvroScan).
-	PaimonAvroScan scan("paimon_manifest_file", context, manifest_file_path);
-	auto &names = scan.GetNames();
+	// Read the manifest Avro file with the native reader (no read_avro; supports zstandard).
+	PaimonAvroReader reader(context, manifest_file_path);
+	auto &names = reader.GetNames();
 
-	// Map column names to indices
 	idx_t kind_idx = FindColumn(names, "_KIND");
 	idx_t bucket_idx = FindColumn(names, "_BUCKET");
 	idx_t total_buckets_idx = FindColumn(names, "_TOTAL_BUCKETS");
@@ -110,78 +84,49 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 		throw IOException("Paimon manifest file missing required columns (_KIND, _FILE)");
 	}
 
-	// Fetch all chunks
-	DataChunk chunk_storage;
-	scan.InitializeChunk(chunk_storage);
-	while (true) {
-		chunk_storage.Reset();
-		if (!scan.GetNext(chunk_storage)) {
-			break;
+	for (idx_t row = 0; row < reader.RowCount(); row++) {
+		PaimonManifestEntryParsed entry;
+
+		auto kind_val = reader.GetValue(row, kind_idx);
+		if (!kind_val.IsNull()) {
+			entry.kind = static_cast<PaimonFileKind>(kind_val.GetValue<int8_t>());
 		}
-		DataChunk *chunk = &chunk_storage;
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			PaimonManifestEntryParsed entry;
-
-			// _KIND: 0=ADD, 1=DELETE
-			auto kind_val = chunk->GetValue(kind_idx, row);
-			if (!kind_val.IsNull()) {
-				entry.kind = static_cast<PaimonFileKind>(kind_val.GetValue<int8_t>());
-			}
-
-			// _BUCKET
-			if (bucket_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(bucket_idx, row);
-				if (!val.IsNull()) {
-					entry.bucket = val.GetValue<int32_t>();
-				}
-			}
-
-			// _TOTAL_BUCKETS
-			if (total_buckets_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(total_buckets_idx, row);
-				if (!val.IsNull()) {
-					entry.total_buckets = val.GetValue<int32_t>();
-				}
-			}
-
-			// _PARTITION: raw BinaryRow bytes (BLOB), decoded later against the partition keys.
-			if (partition_idx != DConstants::INVALID_INDEX) {
-				auto val = chunk->GetValue(partition_idx, row);
-				if (!val.IsNull()) {
-					entry.partition = StringValue::Get(val);
-				}
-			}
-
-			// _FILE is a nested STRUCT — extract the fields we need
-			auto file_val = chunk->GetValue(file_idx, row);
-			if (!file_val.IsNull() && file_val.type().id() == LogicalTypeId::STRUCT) {
-				auto &children = StructValue::GetChildren(file_val);
-				auto &child_types = StructType::GetChildTypes(file_val.type());
-
-				for (idx_t c = 0; c < child_types.size(); c++) {
-					auto &child_name = child_types[c].first;
-					auto &child_val = children[c];
-
-					if (child_val.IsNull()) {
-						continue;
-					}
-
-					if (StringUtil::CIEquals(child_name, "_FILE_NAME")) {
-						entry.file.file_name = child_val.ToString();
-					} else if (StringUtil::CIEquals(child_name, "_FILE_SIZE")) {
-						entry.file.file_size = child_val.GetValue<int64_t>();
-					} else if (StringUtil::CIEquals(child_name, "_ROW_COUNT")) {
-						entry.file.row_count = child_val.GetValue<int64_t>();
-					} else if (StringUtil::CIEquals(child_name, "_SCHEMA_ID")) {
-						entry.file.schema_id = child_val.GetValue<int64_t>();
-					} else if (StringUtil::CIEquals(child_name, "_LEVEL")) {
-						entry.file.level = child_val.GetValue<int32_t>();
-					}
-				}
-			}
-
-			result.push_back(std::move(entry));
+		if (bucket_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, bucket_idx).IsNull()) {
+			entry.bucket = reader.GetValue(row, bucket_idx).GetValue<int32_t>();
 		}
+		if (total_buckets_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, total_buckets_idx).IsNull()) {
+			entry.total_buckets = reader.GetValue(row, total_buckets_idx).GetValue<int32_t>();
+		}
+		// _PARTITION: raw BinaryRow bytes (BLOB), decoded later against the partition keys.
+		if (partition_idx != DConstants::INVALID_INDEX && !reader.GetValue(row, partition_idx).IsNull()) {
+			entry.partition = StringValue::Get(reader.GetValue(row, partition_idx));
+		}
+
+		// _FILE is a nested STRUCT — extract the fields we need.
+		auto file_val = reader.GetValue(row, file_idx);
+		if (!file_val.IsNull() && file_val.type().id() == LogicalTypeId::STRUCT) {
+			auto &children = StructValue::GetChildren(file_val);
+			auto &child_types = StructType::GetChildTypes(file_val.type());
+			for (idx_t c = 0; c < child_types.size(); c++) {
+				auto &child_name = child_types[c].first;
+				auto &child_val = children[c];
+				if (child_val.IsNull()) {
+					continue;
+				}
+				if (StringUtil::CIEquals(child_name, "_FILE_NAME")) {
+					entry.file.file_name = child_val.ToString();
+				} else if (StringUtil::CIEquals(child_name, "_FILE_SIZE")) {
+					entry.file.file_size = child_val.GetValue<int64_t>();
+				} else if (StringUtil::CIEquals(child_name, "_ROW_COUNT")) {
+					entry.file.row_count = child_val.GetValue<int64_t>();
+				} else if (StringUtil::CIEquals(child_name, "_SCHEMA_ID")) {
+					entry.file.schema_id = child_val.GetValue<int64_t>();
+				} else if (StringUtil::CIEquals(child_name, "_LEVEL")) {
+					entry.file.level = child_val.GetValue<int32_t>();
+				}
+			}
+		}
+		result.push_back(std::move(entry));
 	}
 
 	return result;

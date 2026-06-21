@@ -14,8 +14,7 @@ chmod 777 "$WAREHOUSE"  # the Spark container runs as a non-root uid; let it wri
 
 read -r -d '' SQL <<'EOSQL' || true
 CREATE TABLE paimon.default.pk_dv (id INT, v STRING)
-  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'deletion-vectors.enabled'='true',
-                 'manifest.compression'='null');
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'deletion-vectors.enabled'='true');
 INSERT INTO paimon.default.pk_dv VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
 UPDATE paimon.default.pk_dv SET v='B2' WHERE id=2;
 DELETE FROM paimon.default.pk_dv WHERE id=4;
