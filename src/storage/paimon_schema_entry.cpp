@@ -16,6 +16,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "paimon_metadata.hpp"
 #include <fstream>
 #include <ctime>
@@ -68,13 +69,29 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 
 	// Convert DuckDB columns to Paimon schema fields
 	auto &columns = info.Base().columns;
+
+	// Extract primary-key columns from the table constraints (a PK column is required/non-null).
+	case_insensitive_set_t pk_set;
+	for (auto &constraint : info.Base().constraints) {
+		if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				for (auto &idx : unique.GetLogicalIndexes(columns)) {
+					auto pk_name = columns.GetColumn(idx).Name();
+					schema.primary_keys.push_back(pk_name);
+					pk_set.insert(pk_name);
+				}
+			}
+		}
+	}
+
 	for (idx_t i = 0; i < columns.LogicalColumnCount(); i++) {
 		auto &col = columns.GetColumn(LogicalIndex(i));
 		PaimonSchemaField field;
 		field.id = i;
 		field.name = col.Name();
-		// Default to nullable=true unless explicitly constrained (DuckDB defaults to nullable)
-		field.nullable = true;
+		// Primary-key columns are non-null in Paimon; everything else defaults to nullable.
+		field.nullable = pk_set.find(col.Name()) == pk_set.end();
 
 		// Convert DuckDB LogicalType to PaimonDataType
 		auto type = col.Type();
@@ -82,6 +99,9 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 
 		schema.fields.push_back(field);
 	}
+
+	// Bucket mode: append tables are unaware-bucket (-1); PK tables use a single fixed bucket for now.
+	schema.options["bucket"] = schema.primary_keys.empty() ? "-1" : "1";
 
 	// Write the initial Paimon schema file: {table}/schema/schema-0 (no extension, Paimon JSON).
 	string schema_dir = table_path + "/schema";
@@ -197,7 +217,17 @@ static string CreateSchemaJson(const PaimonSchema &schema, int schema_id) {
 	json += "  \"highestFieldId\": " + std::to_string(highest_field_id) + ",\n";
 	json += "  \"partitionKeys\": " + json_array(schema.partition_keys) + ",\n";
 	json += "  \"primaryKeys\": " + json_array(schema.primary_keys) + ",\n";
-	json += "  \"options\": {},\n";
+	json += "  \"options\": {";
+	{
+		idx_t i = 0;
+		for (auto &opt : schema.options) {
+			if (i++ > 0) {
+				json += ", ";
+			}
+			json += "\"" + opt.first + "\": \"" + opt.second + "\"";
+		}
+	}
+	json += "},\n";
 	json += "  \"comment\": \"\"\n";
 	json += "}\n";
 

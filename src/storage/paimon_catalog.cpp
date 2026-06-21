@@ -77,6 +77,15 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	auto &paimon_table = table_entry.Cast<PaimonTableEntry>();
 	string table_path = paimon_table.GetTablePath();
 
+	// Primary-key tables require writing system columns (_KEY_*, _VALUE_KIND, _SEQUENCE_NUMBER) with
+	// globally-monotonic sequence numbers and bucket assignment — not yet implemented. Reject rather
+	// than write a table that can't be merged on read.
+	auto &metadata = paimon_table.GetMetadata();
+	if (metadata.schema && !metadata.schema->primary_keys.empty()) {
+		throw NotImplementedException(
+		    "INSERT into primary-key Paimon tables is not yet supported (append-only tables only)");
+	}
+
 	// Get the column names and types
 	auto names = table_entry.GetColumns().GetColumnNames();
 	auto types = table_entry.GetColumns().GetColumnTypes();
