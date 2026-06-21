@@ -110,7 +110,12 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 
 PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                              PhysicalOperator &plan) {
-	throw NotImplementedException("UPDATE not yet supported for Paimon tables");
+	// UPDATE on a primary-key table is equivalent to re-inserting the row: an INSERT of an existing
+	// key upserts under merge-on-read. SQL UPDATE itself (full-row reconstruction via DuckDB's
+	// DataTable del+insert path) is not wired for the filesystem catalog yet.
+	throw NotImplementedException(
+	    "UPDATE is not yet supported for Paimon tables; INSERT a row with an existing primary key to "
+	    "upsert it (merge-on-read keeps the latest), or DELETE then INSERT");
 }
 
 PhysicalOperator &PaimonCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
