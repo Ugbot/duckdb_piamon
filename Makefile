@@ -36,5 +36,10 @@ paimon-fixtures-venv:
 paimon_data: paimon-fixtures-venv
 	.paimon-fixtures-venv/bin/python scripts/data_generators/generate_paimon_fixtures.py
 
+# Deletion-vector / advanced fixtures from the reference Spark+Paimon engine (needs a container +
+# Maven access). Run tests with DUCKDB_PAIMON_HAVE_SPARK_DATA=1 afterwards.
+paimon_spark_data:
+	bash scripts/data_generators/generate_paimon_spark_fixtures.sh
+
 wasm_pre_build_step:
 	jq 'del(.overrides,.dependencies[5])' vcpkg.json | unexpand -t2 > vcpkg.json.tmp && mv vcpkg.json.tmp vcpkg.json

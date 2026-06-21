@@ -10,10 +10,12 @@ PAIMON_PKG="${PAIMON_PKG:-org.apache.paimon:paimon-spark-3.5:1.0.1}"
 
 rm -rf "$WAREHOUSE"
 mkdir -p "$WAREHOUSE"
+chmod 777 "$WAREHOUSE"  # the Spark container runs as a non-root uid; let it write the warehouse
 
 read -r -d '' SQL <<'EOSQL' || true
 CREATE TABLE paimon.default.pk_dv (id INT, v STRING)
-  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'deletion-vectors.enabled'='true');
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'deletion-vectors.enabled'='true',
+                 'manifest.compression'='null');
 INSERT INTO paimon.default.pk_dv VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
 UPDATE paimon.default.pk_dv SET v='B2' WHERE id=2;
 DELETE FROM paimon.default.pk_dv WHERE id=4;
@@ -22,9 +24,11 @@ EOSQL
 
 podman run --rm \
   -v "$WAREHOUSE":/work/warehouse:Z \
+  --env HOME=/tmp \
   "$SPARK_IMAGE" \
   /opt/spark/bin/spark-sql \
     --packages "$PAIMON_PKG" \
+    --conf spark.jars.ivy=/tmp/.ivy2 \
     --conf spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog \
     --conf spark.sql.catalog.paimon.warehouse=/work/warehouse \
     --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions \

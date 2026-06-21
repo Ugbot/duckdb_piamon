@@ -1,0 +1,59 @@
+# name: test/sql/local/paimon_deletion_vectors.test
+# group: [local]
+#
+# Reads a deletion-vectors-enabled primary-key table produced by the *reference* Apache Spark +
+# Paimon engine (scripts/data_generators/generate_paimon_spark_fixtures.sh): INSERT 1..5, UPDATE
+# id=2, DELETE id=4, INSERT id=6, with deletion-vectors.enabled=true and auto-compaction. This is
+# the authoritative cross-engine check for deletion-vector reads: merge-on-read (sequence number +
+# value kind) resolves the same rows Spark/Paimon resolves, at the latest snapshot and at every
+# historical snapshot — no separate deletion-vector bitmap application is required for PK tables.
+#
+# Generate the fixture with: make paimon_spark_data  (needs a Spark container + Maven access).
+
+require avro
+
+require parquet
+
+require-env DUCKDB_PAIMON_HAVE_SPARK_DATA
+
+statement ok
+LOAD '__WORKING_DIRECTORY__/build/release/extension/iceberg/paimon.duckdb_extension';
+
+# Latest: id=2 updated to 'B2', id=4 deleted, id=6 inserted.
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_dv') ORDER BY id;
+----
+1	a
+2	B2
+3	c
+5	e
+6	f
+
+# Time travel: snapshot 1 is the initial insert (before update/delete/insert).
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_dv', snapshot_from_id => 1) ORDER BY id;
+----
+1	a
+2	b
+3	c
+4	d
+5	e
+
+# Snapshot 4 (after UPDATE id=2, before DELETE id=4): id=4 still present.
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_dv', snapshot_from_id => 4) ORDER BY id;
+----
+1	a
+2	B2
+3	c
+4	d
+5	e
+
+# Snapshot 5 (the DELETE of id=4, recorded with deletion vectors): id=4 correctly gone.
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_dv', snapshot_from_id => 5) ORDER BY id;
+----
+1	a
+2	B2
+3	c
+5	e
