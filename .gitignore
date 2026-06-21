@@ -125,3 +125,14 @@ taskmanager.out
 docs/
 # Paimon fixture generation venv
 .paimon-fixtures-venv/
+
+# Prebuilt/throwaway binaries and one-off artifacts (use build/ instead)
+duckdb_binary
+duckdb_macos.gz
+test_extension
+testext
+*.gz
+
+# Local tooling state (not part of the extension)
+.claude/
+.llm-station/
