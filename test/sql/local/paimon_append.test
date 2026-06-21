@@ -56,6 +56,15 @@ SELECT id, a, b FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/de
 3	13	x
 4	14	y
 
+# --- Schema evolution: a RENAMED column keeps its old data under the new name (field-id mapping,
+# matching Spark/Flink). a was renamed to b after the first commit. ---
+query II
+SELECT id, b FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/renamed') ORDER BY id;
+----
+1	10
+2	20
+3	30
+
 # --- Catalog ATTACH + catalog-integrated scan ---
 statement ok
 ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);

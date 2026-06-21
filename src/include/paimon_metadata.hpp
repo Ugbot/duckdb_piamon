@@ -280,6 +280,10 @@ public:
 	PaimonSnapshot *FindSnapshotById(uint64_t snapshot_id);
 	PaimonSnapshot *GetCurrentSnapshot(const PaimonOptions &options);
 
+	//! Load a specific schema version (schema/schema-<id>) from disk. Used for field-id mapping
+	//! across schema evolution (renamed/reordered columns).
+	static unique_ptr<PaimonSchema> LoadSchema(const string &table_location, int64_t schema_id, FileSystem &fs);
+
 	// Schema parsing helpers (kept for compatibility)
 	static void ParseSchemaFromJson(yyjson_val *schema_obj, PaimonSchema &schema);
 	static void ParseSchemaFieldFromJson(yyjson_val *field_obj, PaimonSchemaField &field);

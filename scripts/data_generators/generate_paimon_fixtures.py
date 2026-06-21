@@ -179,6 +179,25 @@ def gen_evolve(catalog, db):
     return ("evolve", 5)
 
 
+def gen_rename(catalog, db):
+    """Append table with a column RENAME between commits. Field ids are stable, so the renamed
+    column's old data must be preserved under the new name (matches Spark/Flink; pypaimon's own
+    reader returns NULL here, so this is validated against Spark, not pypaimon)."""
+    from pypaimon.schema.schema_change import SchemaChange
+
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("a", pa.int64())]),
+        options={"bucket": "-1"},
+    )
+    catalog.create_table(f"{db}.renamed", schema, False)
+    table = catalog.get_table(f"{db}.renamed")
+    write(table, pa.record_batch({"id": pa.array([1, 2], pa.int64()), "a": pa.array([10, 20], pa.int64())}))
+    catalog.alter_table(f"{db}.renamed", [SchemaChange.rename_column("a", "b")], False)
+    table = catalog.get_table(f"{db}.renamed")
+    write(table, pa.record_batch({"id": pa.array([3], pa.int64()), "b": pa.array([30], pa.int64())}))
+    return ("renamed", 3)
+
+
 def gen_tagged(catalog, db):
     """Append table with a tag created at the first snapshot, for tag time-travel tests."""
     schema = Schema.from_pyarrow_schema(
@@ -208,7 +227,7 @@ def main():
         pass
 
     results = []
-    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged):
+    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged, gen_rename):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")

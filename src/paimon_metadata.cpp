@@ -362,6 +362,13 @@ static PaimonDataType ParsePaimonTypeString(const string &type_str) {
 // Schema File Loading
 //===--------------------------------------------------------------------===//
 
+static unique_ptr<PaimonSchema> LoadSchemaFile(const string &table_location, int64_t schema_id, FileSystem &fs);
+
+unique_ptr<PaimonSchema> PaimonTableMetadata::LoadSchema(const string &table_location, int64_t schema_id,
+                                                         FileSystem &fs) {
+	return LoadSchemaFile(table_location, schema_id, fs);
+}
+
 static unique_ptr<PaimonSchema> LoadSchemaFile(const string &table_location, int64_t schema_id, FileSystem &fs) {
 	// Paimon schema files are at: {table}/schema/schema-{id}
 	string schema_path = table_location + "/schema/schema-" + std::to_string(schema_id);

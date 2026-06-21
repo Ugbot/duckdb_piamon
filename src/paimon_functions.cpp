@@ -23,6 +23,7 @@
 
 #include <unordered_map>
 #include <utility>
+#include <algorithm>
 
 namespace duckdb {
 
@@ -159,6 +160,41 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	return_types = result->return_types;
 	names = result->names;
 
+	// Field-id mapping across schema evolution: a column read from an older data file may have been
+	// renamed, so we COALESCE over all historical names of each latest field id (latest name first).
+	// Paimon field ids are stable; this matches the Spark/Flink readers (a renamed column keeps its
+	// old data, unlike a name-only match). pk columns are immutable so this only affects values.
+	case_insensitive_map_t<vector<string>> field_history; // latest column name -> [latest, ...older names]
+	if (file_list.metadata && file_list.metadata->schema && file_list.metadata->schema->id > 0) {
+		auto &latest = *file_list.metadata->schema;
+		unordered_map<int, idx_t> id_to_pos; // field id -> index into result->names
+		for (idx_t i = 0; i < latest.fields.size(); i++) {
+			field_history[latest.fields[i].name] = {latest.fields[i].name};
+			id_to_pos[latest.fields[i].id] = i;
+		}
+		FileSystem &fs2 = FileSystem::GetFileSystem(context);
+		for (int64_t sid = latest.id - 1; sid >= 0; sid--) {
+			try {
+				auto old_schema = PaimonTableMetadata::LoadSchema(table_path, sid, fs2);
+				if (!old_schema) {
+					continue;
+				}
+				for (auto &of : old_schema->fields) {
+					auto it = id_to_pos.find(of.id);
+					if (it == id_to_pos.end()) {
+						continue; // field dropped before the latest schema
+					}
+					auto &hist = field_history[latest.fields[it->second].name];
+					if (std::find(hist.begin(), hist.end(), of.name) == hist.end()) {
+						hist.push_back(of.name);
+					}
+				}
+			} catch (const std::exception &e) {
+				// Missing/unreadable older schema — skip.
+			}
+		}
+	}
+
 	// Build the projection list (cast each column to its Paimon logical type so the query result
 	// types match the declared schema exactly).
 	string projection;
@@ -166,8 +202,18 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		if (i > 0) {
 			projection += ", ";
 		}
-		projection += "CAST(" + QuoteIdentifier(result->names[i]) + " AS " + result->return_types[i].ToString() +
-		              ") AS " + QuoteIdentifier(result->names[i]);
+		const string &col = result->names[i];
+		string source_expr = QuoteIdentifier(col);
+		auto hist = field_history.find(col);
+		if (hist != field_history.end() && hist->second.size() > 1) {
+			source_expr = "COALESCE(";
+			for (idx_t h = 0; h < hist->second.size(); h++) {
+				source_expr += (h ? ", " : "") + QuoteIdentifier(hist->second[h]);
+			}
+			source_expr += ")";
+		}
+		projection += "CAST(" + source_expr + " AS " + result->return_types[i].ToString() + ") AS " +
+		              QuoteIdentifier(col);
 	}
 
 	if (file_list.files.empty()) {
