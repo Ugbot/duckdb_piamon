@@ -92,6 +92,19 @@ SELECT id, v FROM pm.pk_w WHERE id = 0;
 ----
 0	reborn
 
+# UPDATE rewrites matched rows (upsert with the new value); unchanged columns are preserved.
+statement ok
+UPDATE pm.pk_w SET v = 'patched' WHERE id IN (2, 4);
+
+query IT
+SELECT id, v FROM pm.pk_w ORDER BY id;
+----
+0	reborn
+1	a1
+2	patched
+3	a3
+4	patched
+
 # DROP removes the table from the catalog and deletes its directory.
 statement ok
 DROP TABLE pm.paimon_write_t;

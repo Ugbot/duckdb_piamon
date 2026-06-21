@@ -1,61 +1,46 @@
-//===----------------------------------------------------------------------===//
-//                         DuckDB
-//
-// storage/paimon_update.hpp
-//
-//
-//===----------------------------------------------------------------------===//
-
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/parser/constraint.hpp"
 
 namespace duckdb {
 
-//! PhysicalUpdate represents an UPDATE operation
+//! Physical UPDATE for primary-key Paimon tables. The child plan produces, per matched row, the new
+//! values of the updated columns plus the row-id (= primary-key value). UPDATE is realized as an
+//! upsert: at Finalize we join the table's current rows (via paimon_scan) with the buffered updates,
+//! overwrite the updated columns, and write the full rows back as INSERT records at a higher
+//! sequence number (merge-on-read keeps the latest).
 class PaimonUpdate : public PhysicalOperator {
 public:
-	PaimonUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &tableref,
-	              vector<PhysicalIndex> columns, vector<unique_ptr<Expression>> expressions,
-	              vector<unique_ptr<Expression>> bound_defaults,
-	              vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
-	              bool return_chunk);
+	PaimonUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &table, idx_t row_id_index,
+	             string table_path, string pk_name, vector<string> value_names, vector<LogicalType> value_types,
+	             vector<string> updated_columns, vector<idx_t> updated_child_indexes, idx_t estimated_cardinality);
 
 public:
-	//! The table to update
-	TableCatalogEntry &tableref;
-	//! The columns to update
-	vector<PhysicalIndex> columns;
-	//! The expressions to update with
-	vector<unique_ptr<Expression>> expressions;
-	//! The bound defaults
-	vector<unique_ptr<Expression>> bound_defaults;
-	//! The bound constraints
-	vector<unique_ptr<BoundConstraint>> bound_constraints;
-	//! Whether to return the updated chunk
-	bool return_chunk;
+	bool IsSink() const override {
+		return true;
+	}
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
-public:
-	// Source interface
+	bool IsSource() const override {
+		return true;
+	}
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 
-	// Sink interface
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-
-	// State interface
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-
-	// Operator interface
 	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
-private:
-	mutable bool finished = false;
+public:
+	TableCatalogEntry &table;
+	idx_t row_id_index;
+	string table_path;
+	string pk_name;
+	vector<string> value_names;
+	vector<LogicalType> value_types;
+	vector<string> updated_columns;       //! names of the columns being SET
+	vector<idx_t> updated_child_indexes;  //! child-chunk index of each SET value
 };
 
 } // namespace duckdb

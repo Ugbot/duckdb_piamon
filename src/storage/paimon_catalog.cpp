@@ -4,6 +4,7 @@
 #include "storage/paimon_schema_entry.hpp"
 #include "storage/paimon_table_entry.hpp"
 #include "storage/paimon_delete.hpp"
+#include "storage/paimon_update.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -110,12 +111,33 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 
 PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                              PhysicalOperator &plan) {
-	// UPDATE on a primary-key table is equivalent to re-inserting the row: an INSERT of an existing
-	// key upserts under merge-on-read. SQL UPDATE itself (full-row reconstruction via DuckDB's
-	// DataTable del+insert path) is not wired for the filesystem catalog yet.
-	throw NotImplementedException(
-	    "UPDATE is not yet supported for Paimon tables; INSERT a row with an existing primary key to "
-	    "upsert it (merge-on-read keeps the latest), or DELETE then INSERT");
+	auto &paimon_table = op.table.Cast<PaimonTableEntry>();
+	auto &metadata = paimon_table.GetMetadata();
+	if (!metadata.schema || metadata.schema->primary_keys.size() != 1) {
+		throw NotImplementedException(
+		    "UPDATE on Paimon tables is currently supported only for single primary-key tables");
+	}
+	auto names = op.table.GetColumns().GetColumnNames();
+	auto types = op.table.GetColumns().GetColumnTypes();
+
+	// Map each SET expression to the column it updates and its position in the child chunk.
+	vector<string> updated_columns;
+	vector<idx_t> updated_child_indexes;
+	for (idx_t i = 0; i < op.expressions.size(); i++) {
+		if (op.expressions[i]->GetExpressionType() != ExpressionType::BOUND_REF) {
+			throw NotImplementedException("UPDATE with DEFAULT or complex SET expressions is not yet supported "
+			                              "for Paimon tables");
+		}
+		auto &ref = op.expressions[i]->Cast<BoundReferenceExpression>();
+		updated_columns.push_back(names[op.columns[i].index]);
+		updated_child_indexes.push_back(ref.index);
+	}
+
+	auto &upd = planner.Make<PaimonUpdate>(op.types, op.table, 0, paimon_table.GetTablePath(),
+	                                       metadata.schema->primary_keys[0], names, types, updated_columns,
+	                                       updated_child_indexes, op.estimated_cardinality);
+	upd.children.push_back(plan);
+	return upd;
 }
 
 PhysicalOperator &PaimonCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
