@@ -59,6 +59,9 @@ struct PaimonScanBindData : public TableFunctionData {
 	string sql;            // the query to run (empty when there are no files)
 	vector<LogicalType> return_types;
 	vector<string> names;
+	//! Output index of a single BIGINT primary-key column, or -1. When set, the row-id virtual
+	//! column emits this column's value (so catalog DELETE can identify rows by key).
+	int64_t rowid_pk_index = -1;
 };
 
 struct PaimonScanGlobalState : public GlobalTableFunctionState {
@@ -128,6 +131,18 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	vector<string> primary_keys;
 	if (is_pk) {
 		primary_keys = file_list.metadata->schema->primary_keys;
+	}
+
+	// If the table has a single BIGINT primary key, expose it as the row-id virtual column so the
+	// catalog DELETE path can identify rows by key (DuckDB's rowid is BIGINT).
+	if (primary_keys.size() == 1) {
+		for (idx_t i = 0; i < result->names.size(); i++) {
+			if (StringUtil::CIEquals(result->names[i], primary_keys[0]) &&
+			    result->return_types[i].id() == LogicalTypeId::BIGINT) {
+				result->rowid_pk_index = (int64_t)i;
+				break;
+			}
+		}
 	}
 
 	return_types = result->return_types;
@@ -203,6 +218,7 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
 
 static void PaimonScanExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<PaimonScanGlobalState>();
+	auto &bind_data = data.bind_data->Cast<PaimonScanBindData>();
 	if (!state.result) {
 		output.SetCardinality(0);
 		return;
@@ -218,9 +234,14 @@ static void PaimonScanExec(ClientContext &context, TableFunctionInput &data, Dat
 	for (idx_t i = 0; i < state.column_ids.size(); i++) {
 		auto col_id = state.column_ids[i];
 		if (col_id >= chunk.ColumnCount()) {
-			// Row-id / virtual column (e.g. requested by COUNT(*)): emit a row-number sequence.
-			// The actual values are not meaningful for Paimon, only the cardinality is.
-			output.data[i].Sequence(0, 1, chunk.size());
+			// Row-id / virtual column. For a single BIGINT primary-key table, emit the key value so
+			// catalog DELETE can identify rows; otherwise emit a row-number sequence (only the
+			// cardinality matters, e.g. for COUNT(*)).
+			if (bind_data.rowid_pk_index >= 0 && (idx_t)bind_data.rowid_pk_index < chunk.ColumnCount()) {
+				output.data[i].Reference(chunk.data[bind_data.rowid_pk_index]);
+			} else {
+				output.data[i].Sequence(0, 1, chunk.size());
+			}
 		} else {
 			output.data[i].Reference(chunk.data[col_id]);
 		}

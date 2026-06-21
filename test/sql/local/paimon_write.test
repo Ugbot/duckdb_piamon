@@ -71,6 +71,27 @@ SELECT id, v FROM pm.pk_w ORDER BY id;
 4	a4
 5	new
 
+# DELETE writes delete tombstones; merge-on-read then drops those keys.
+statement ok
+DELETE FROM pm.pk_w WHERE id IN (0, 5);
+
+query IT
+SELECT id, v FROM pm.pk_w ORDER BY id;
+----
+1	a1
+2	updated
+3	a3
+4	a4
+
+# A re-INSERT of a previously deleted key brings it back (higher sequence wins).
+statement ok
+INSERT INTO pm.pk_w VALUES (0, 'reborn');
+
+query IT
+SELECT id, v FROM pm.pk_w WHERE id = 0;
+----
+0	reborn
+
 # DROP removes the table from the catalog and deletes its directory.
 statement ok
 DROP TABLE pm.paimon_write_t;

@@ -49,10 +49,13 @@ public:
 	                                           const string &data_path, const vector<string> &names,
 	                                           const vector<LogicalType> &types, optional_ptr<PhysicalOperator> plan);
 
+public:
+	//! Create manifest + manifest-list + snapshot after writing (carrying prior manifests forward).
+	//! Shared by INSERT and DELETE/UPDATE (which add data files / tombstones).
+	static void CommitWrittenFiles(ClientContext &context, const string &table_path,
+	                               const vector<PaimonWrittenFile> &written_files, idx_t total_rows);
+
 private:
-	//! Create manifest + manifest-list + snapshot after writing
-	void CommitWrittenFiles(ClientContext &context, const string &table_path,
-	                        const vector<PaimonWrittenFile> &written_files, idx_t total_rows) const;
 
 	//! Write a primary-key data file (value columns + _KEY_*, _SEQUENCE_NUMBER, _VALUE_KIND system
 	//! columns) from buffered rows, then commit. Returns the written-file metadata.

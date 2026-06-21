@@ -233,7 +233,7 @@ void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &ta
 //===--------------------------------------------------------------------===//
 
 void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &table_path,
-                                      const vector<PaimonWrittenFile> &written_files, idx_t total_rows) const {
+                                      const vector<PaimonWrittenFile> &written_files, idx_t total_rows) {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 	FileStorePathFactory path_factory(table_path, 1);
 

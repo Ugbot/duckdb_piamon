@@ -101,6 +101,7 @@ set(PAIMON_EXTENSION_SOURCES
     src/storage/paimon_schema_entry.cpp
     src/storage/paimon_table_entry.cpp
     src/storage/paimon_insert.cpp
+    src/storage/paimon_delete.cpp
     src/storage/paimon_transaction_manager.cpp
 )
 build_loadable_extension(${PAIMON_TARGET_NAME} ${PARAMETERS} ${PAIMON_EXTENSION_SOURCES} ${ALL_OBJECT_FILES})

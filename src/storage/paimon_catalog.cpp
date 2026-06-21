@@ -3,6 +3,8 @@
 #include "duckdb/storage/database_size.hpp"
 #include "storage/paimon_schema_entry.hpp"
 #include "storage/paimon_table_entry.hpp"
+#include "storage/paimon_delete.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -113,7 +115,20 @@ PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlan
 
 PhysicalOperator &PaimonCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                              PhysicalOperator &plan) {
-	throw NotImplementedException("DELETE not yet supported for Paimon tables");
+	auto &paimon_table = op.table.Cast<PaimonTableEntry>();
+	auto &metadata = paimon_table.GetMetadata();
+	if (!metadata.schema || metadata.schema->primary_keys.size() != 1) {
+		throw NotImplementedException(
+		    "DELETE on Paimon tables is currently supported only for single primary-key tables");
+	}
+	// The bound row-id expression locates the key column produced by the child scan.
+	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
+	auto names = op.table.GetColumns().GetColumnNames();
+	auto types = op.table.GetColumns().GetColumnTypes();
+	auto &del = planner.Make<PaimonDelete>(op.types, op.table, bound_ref.index, paimon_table.GetTablePath(),
+	                                       metadata.schema->primary_keys, names, types, op.estimated_cardinality);
+	del.children.push_back(plan);
+	return del;
 }
 
 DatabaseSize PaimonCatalog::GetDatabaseSize(ClientContext &context) {

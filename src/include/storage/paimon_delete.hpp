@@ -1,56 +1,43 @@
-//===----------------------------------------------------------------------===//
-//                         DuckDB
-//
-// storage/paimon_delete.hpp
-//
-//
-//===----------------------------------------------------------------------===//
-
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/parser/constraint.hpp"
 
 namespace duckdb {
 
-//! PhysicalDelete represents a DELETE operation
+//! Physical DELETE for primary-key Paimon tables. The child plan produces the deleted rows; the
+//! row-id column (= the primary-key value, see paimon_scan) is buffered and, on Finalize, written
+//! as a data file of delete tombstones (_VALUE_KIND = DELETE) at a higher sequence number than any
+//! existing row, so merge-on-read drops those keys.
 class PaimonDelete : public PhysicalOperator {
 public:
-	PaimonDelete(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &tableref,
-	              vector<unique_ptr<Expression>> expressions,
-	              vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
-	              bool return_chunk);
+	PaimonDelete(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &table, idx_t row_id_index,
+	             string table_path, vector<string> pk_names, vector<string> value_names,
+	             vector<LogicalType> value_types, idx_t estimated_cardinality);
 
 public:
-	//! The table to delete from
-	TableCatalogEntry &tableref;
-	//! The expressions for the WHERE clause
-	vector<unique_ptr<Expression>> expressions;
-	//! The bound constraints
-	vector<unique_ptr<BoundConstraint>> bound_constraints;
-	//! Whether to return the deleted chunk
-	bool return_chunk;
+	bool IsSink() const override {
+		return true;
+	}
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
-public:
-	// Source interface
+	bool IsSource() const override {
+		return true;
+	}
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 
-	// Sink interface
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-
-	// State interface
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-
-	// Operator interface
 	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
-private:
-	mutable bool finished = false;
+public:
+	TableCatalogEntry &table;
+	idx_t row_id_index;
+	string table_path;
+	vector<string> pk_names;
+	vector<string> value_names;
+	vector<LogicalType> value_types;
 };
 
 } // namespace duckdb
