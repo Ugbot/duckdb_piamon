@@ -10,8 +10,6 @@
 #
 # Generate the fixture with: make paimon_spark_data  (needs a Spark container + Maven access).
 
-require avro
-
 require parquet
 
 require-env DUCKDB_PAIMON_HAVE_SPARK_DATA

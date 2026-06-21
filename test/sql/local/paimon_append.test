@@ -5,8 +5,6 @@
 # (scripts/data_generators/generate_paimon_fixtures.py, seed=42).
 # Generate with: .paimon-fixtures-venv/bin/python scripts/data_generators/generate_paimon_fixtures.py
 
-require avro
-
 require parquet
 
 require-env DUCKDB_PAIMON_HAVE_GENERATED_DATA

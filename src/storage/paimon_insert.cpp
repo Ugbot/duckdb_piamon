@@ -3,6 +3,7 @@
 #include "storage/paimon_table_entry.hpp"
 #include "paimon_metadata.hpp"
 #include "paimon_manifest.hpp"
+#include "paimon_avro_writer.hpp"
 #include "iceberg_utils.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
@@ -23,6 +24,77 @@
 #include <ctime>
 
 namespace duckdb {
+
+//===--------------------------------------------------------------------===//
+// Avro schemas + Value builders for native manifest writing (see PaimonAvroWriter).
+//===--------------------------------------------------------------------===//
+
+// SimpleStats sub-record (reused for _PARTITION_STATS / _KEY_STATS / _VALUE_STATS).
+static const char *SIMPLE_STATS_FIELDS =
+    "{\"name\":\"_MIN_VALUES\",\"type\":\"bytes\"},"
+    "{\"name\":\"_MAX_VALUES\",\"type\":\"bytes\"},"
+    "{\"name\":\"_NULL_COUNTS\",\"type\":{\"type\":\"array\",\"items\":\"long\"}}";
+
+static string ManifestListSchemaJson() {
+	return string("{\"type\":\"record\",\"name\":\"manifest_list\",\"fields\":["
+	              "{\"name\":\"_FILE_NAME\",\"type\":\"string\"},"
+	              "{\"name\":\"_FILE_SIZE\",\"type\":\"long\"},"
+	              "{\"name\":\"_NUM_ADDED_FILES\",\"type\":\"long\"},"
+	              "{\"name\":\"_NUM_DELETED_FILES\",\"type\":\"long\"},"
+	              "{\"name\":\"_PARTITION_STATS\",\"type\":{\"type\":\"record\",\"name\":\"part_stats\","
+	              "\"fields\":[") +
+	       SIMPLE_STATS_FIELDS +
+	       "]}},"
+	       "{\"name\":\"_SCHEMA_ID\",\"type\":\"long\"}]}";
+}
+
+static string ManifestEntrySchemaJson() {
+	string ks = string("{\"type\":\"record\",\"name\":\"key_stats\",\"fields\":[") + SIMPLE_STATS_FIELDS + "]}";
+	string vs = string("{\"type\":\"record\",\"name\":\"value_stats\",\"fields\":[") + SIMPLE_STATS_FIELDS + "]}";
+	return string("{\"type\":\"record\",\"name\":\"manifest_entry\",\"fields\":["
+	              "{\"name\":\"_KIND\",\"type\":\"int\"},"
+	              "{\"name\":\"_PARTITION\",\"type\":\"bytes\"},"
+	              "{\"name\":\"_BUCKET\",\"type\":\"int\"},"
+	              "{\"name\":\"_TOTAL_BUCKETS\",\"type\":\"int\"},"
+	              "{\"name\":\"_FILE\",\"type\":{\"type\":\"record\",\"name\":\"data_file\",\"fields\":["
+	              "{\"name\":\"_FILE_NAME\",\"type\":\"string\"},"
+	              "{\"name\":\"_FILE_SIZE\",\"type\":\"long\"},"
+	              "{\"name\":\"_ROW_COUNT\",\"type\":\"long\"},"
+	              "{\"name\":\"_MIN_KEY\",\"type\":\"bytes\"},"
+	              "{\"name\":\"_MAX_KEY\",\"type\":\"bytes\"},"
+	              "{\"name\":\"_KEY_STATS\",\"type\":") +
+	       ks +
+	       "},"
+	       "{\"name\":\"_VALUE_STATS\",\"type\":" +
+	       vs +
+	       "},"
+	       "{\"name\":\"_MIN_SEQUENCE_NUMBER\",\"type\":\"long\"},"
+	       "{\"name\":\"_MAX_SEQUENCE_NUMBER\",\"type\":\"long\"},"
+	       "{\"name\":\"_SCHEMA_ID\",\"type\":\"long\"},"
+	       "{\"name\":\"_LEVEL\",\"type\":\"int\"},"
+	       "{\"name\":\"_EXTRA_FILES\",\"type\":{\"type\":\"array\",\"items\":\"string\"}},"
+	       "{\"name\":\"_CREATION_TIME\",\"type\":[\"null\",\"long\"]},"
+	       "{\"name\":\"_DELETE_ROW_COUNT\",\"type\":[\"null\",\"long\"]},"
+	       "{\"name\":\"_EMBEDDED_FILE_INDEX\",\"type\":[\"null\",\"bytes\"]},"
+	       "{\"name\":\"_FILE_SOURCE\",\"type\":[\"null\",\"int\"]},"
+	       "{\"name\":\"_VALUE_STATS_COLS\",\"type\":[\"null\",{\"type\":\"array\",\"items\":\"string\"}]},"
+	       "{\"name\":\"_EXTERNAL_PATH\",\"type\":[\"null\",\"string\"]}"
+	       "]}}]}";
+}
+
+static Value EmptyBytes() {
+	return Value::BLOB((const_data_ptr_t) "", 0);
+}
+
+// SimpleStats value: 12 zero bytes for min/max (matches Paimon's empty-row encoding), no null counts.
+static Value SimpleStatsValue() {
+	string zeros(12, '\0');
+	child_list_t<Value> kv;
+	kv.emplace_back("_MIN_VALUES", Value::BLOB((const_data_ptr_t)zeros.data(), 12));
+	kv.emplace_back("_MAX_VALUES", Value::BLOB((const_data_ptr_t)zeros.data(), 12));
+	kv.emplace_back("_NULL_COUNTS", Value::LIST(LogicalType::BIGINT, vector<Value>()));
+	return Value::STRUCT(std::move(kv));
+}
 
 //===--------------------------------------------------------------------===//
 // Global State
@@ -255,68 +327,47 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	string manifest_uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	string manifest_list_uuid = UUID::ToString(UUID::GenerateRandomUUID());
 
-	// Step 1: Create manifest file (Avro) containing ManifestEntry rows
+	// Step 1: Write the manifest file (Avro) natively — one ManifestEntry record per added data file.
 	string manifest_file_path = path_factory.manifestFilePath(manifest_uuid, 0);
 	{
-		// Build manifest entries as a SQL query, then COPY to Avro
-		string entries_sql;
-		for (idx_t i = 0; i < written_files.size(); i++) {
-			if (i > 0) {
-				entries_sql += " UNION ALL ";
-			}
-
-			// Paimon manifests store only the data file's basename. The full path is reconstructed
-			// by readers from the table location + partition dir + bucket-N + this name, so storing a
-			// "bucket-0/..."-prefixed path would double the bucket directory.
-			auto &wf = written_files[i];
+		vector<vector<Value>> entry_rows;
+		for (auto &wf : written_files) {
+			// Manifests store only the data file's basename; readers reconstruct the full path from
+			// the table location + partition dir + bucket-N.
 			string relative_path = wf.file_path;
 			size_t last_slash = relative_path.find_last_of('/');
 			if (last_slash != string::npos) {
 				relative_path = relative_path.substr(last_slash + 1);
 			}
+			child_list_t<Value> file;
+			file.emplace_back("_FILE_NAME", Value(relative_path));
+			file.emplace_back("_FILE_SIZE", Value::BIGINT(wf.file_size));
+			file.emplace_back("_ROW_COUNT", Value::BIGINT(wf.row_count));
+			file.emplace_back("_MIN_KEY", EmptyBytes());
+			file.emplace_back("_MAX_KEY", EmptyBytes());
+			file.emplace_back("_KEY_STATS", SimpleStatsValue());
+			file.emplace_back("_VALUE_STATS", SimpleStatsValue());
+			file.emplace_back("_MIN_SEQUENCE_NUMBER", Value::BIGINT(0));
+			file.emplace_back("_MAX_SEQUENCE_NUMBER", Value::BIGINT(0));
+			file.emplace_back("_SCHEMA_ID", Value::BIGINT(0));
+			file.emplace_back("_LEVEL", Value::INTEGER(0));
+			file.emplace_back("_EXTRA_FILES", Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+			file.emplace_back("_CREATION_TIME", Value(LogicalType::BIGINT));
+			file.emplace_back("_DELETE_ROW_COUNT", Value(LogicalType::BIGINT));
+			file.emplace_back("_EMBEDDED_FILE_INDEX", Value(LogicalType::BLOB));
+			file.emplace_back("_FILE_SOURCE", Value(LogicalType::INTEGER));
+			file.emplace_back("_VALUE_STATS_COLS", Value(LogicalType::LIST(LogicalType::VARCHAR)));
+			file.emplace_back("_EXTERNAL_PATH", Value(LogicalType::VARCHAR));
 
-			// Build a named STRUCT for _FILE so the Avro record carries the spec field names
-			// (_FILE_NAME, _FILE_SIZE, ...) that readers match on.
-			entries_sql += "SELECT ";
-			entries_sql += "CAST(0 AS INTEGER) AS _KIND, ";                           // ADD
-			entries_sql += "CAST('' AS BLOB) AS _PARTITION, ";                        // Empty for non-partitioned
-			entries_sql += "CAST(" + std::to_string(wf.bucket) + " AS INTEGER) AS _BUCKET, ";
-			entries_sql += "CAST(1 AS INTEGER) AS _TOTAL_BUCKETS, ";
-			entries_sql += "{";
-			entries_sql += "'_FILE_NAME': '" + relative_path + "', ";
-			entries_sql += "'_FILE_SIZE': CAST(" + std::to_string(wf.file_size) + " AS BIGINT), ";
-			entries_sql += "'_ROW_COUNT': CAST(" + std::to_string(wf.row_count) + " AS BIGINT), ";
-			// Empty SimpleStats (min/max = empty BinaryRow = 12 zero bytes; no null counts). Readers
-			// require these to be records, not blobs.
-			string empty_stats = "{'_MIN_VALUES': "
-			                     "'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-			                     "'_MAX_VALUES': "
-			                     "'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-			                     "'_NULL_COUNTS': CAST([] AS BIGINT[])}";
-			entries_sql += "'_MIN_KEY': CAST('' AS BLOB), ";
-			entries_sql += "'_MAX_KEY': CAST('' AS BLOB), ";
-			entries_sql += "'_KEY_STATS': " + empty_stats + ", ";
-			entries_sql += "'_VALUE_STATS': " + empty_stats + ", ";
-			entries_sql += "'_MIN_SEQUENCE_NUMBER': CAST(0 AS BIGINT), ";
-			entries_sql += "'_MAX_SEQUENCE_NUMBER': CAST(0 AS BIGINT), ";
-			entries_sql += "'_SCHEMA_ID': CAST(0 AS BIGINT), ";
-			entries_sql += "'_LEVEL': CAST(0 AS INTEGER), ";
-			entries_sql += "'_EXTRA_FILES': CAST([] AS VARCHAR[]), ";
-			entries_sql += "'_CREATION_TIME': CAST(NULL AS BIGINT), ";
-			entries_sql += "'_DELETE_ROW_COUNT': CAST(NULL AS BIGINT), ";
-			entries_sql += "'_EMBEDDED_FILE_INDEX': CAST(NULL AS BLOB), ";
-			entries_sql += "'_FILE_SOURCE': CAST(NULL AS INTEGER), ";
-			entries_sql += "'_VALUE_STATS_COLS': CAST(NULL AS VARCHAR[]), ";
-			entries_sql += "'_EXTERNAL_PATH': CAST(NULL AS VARCHAR)";
-			entries_sql += "} AS _FILE";
+			vector<Value> row;
+			row.push_back(Value::INTEGER(0)); // _KIND = ADD
+			row.push_back(EmptyBytes());      // _PARTITION (unpartitioned)
+			row.push_back(Value::INTEGER(wf.bucket));
+			row.push_back(Value::INTEGER(1)); // _TOTAL_BUCKETS
+			row.push_back(Value::STRUCT(std::move(file)));
+			entry_rows.push_back(std::move(row));
 		}
-
-		string copy_sql = "COPY (" + entries_sql + ") TO '" + manifest_file_path + "' (FORMAT AVRO)";
-		auto result = conn.Query(copy_sql);
-		if (!result || result->HasError()) {
-			throw IOException("Failed to write Paimon manifest file: " +
-			                  (result ? result->GetError() : "unknown error"));
-		}
+		PaimonAvroWriter::WriteFile(context, manifest_file_path, ManifestEntrySchemaJson(), entry_rows);
 	}
 
 	// Get actual manifest file size
@@ -326,35 +377,22 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		manifest_file_size = handle->GetFileSize();
 	}
 
-	// Step 2: Create delta manifest list (Avro) referencing the manifest file
+	// Step 2: Write the delta manifest list (Avro) natively, referencing the new manifest file.
 	string manifest_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 0);
 	{
-		// Extract just the manifest filename
 		string manifest_filename = manifest_file_path;
 		size_t last_slash = manifest_filename.find_last_of('/');
 		if (last_slash != string::npos) {
 			manifest_filename = manifest_filename.substr(last_slash + 1);
 		}
-
-		string list_sql = "SELECT ";
-		list_sql += "'" + manifest_filename + "' AS _FILE_NAME, ";
-		list_sql += "CAST(" + std::to_string(manifest_file_size) + " AS BIGINT) AS _FILE_SIZE, ";
-		list_sql += "CAST(" + std::to_string(written_files.size()) + " AS BIGINT) AS _NUM_ADDED_FILES, ";
-		list_sql += "CAST(0 AS BIGINT) AS _NUM_DELETED_FILES, ";
-		// _PARTITION_STATS must be a non-null SimpleStats record. For an unpartitioned table the
-		// partition is an empty BinaryRow (12 zero bytes, matching Paimon's own output) and there are
-		// no per-partition null counts.
-		list_sql += "{'_MIN_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-		            "'_MAX_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-		            "'_NULL_COUNTS': CAST([] AS BIGINT[])} AS _PARTITION_STATS, ";
-		list_sql += "CAST(0 AS BIGINT) AS _SCHEMA_ID";
-
-		string copy_sql = "COPY (" + list_sql + ") TO '" + manifest_list_path + "' (FORMAT AVRO)";
-		auto result = conn.Query(copy_sql);
-		if (!result || result->HasError()) {
-			throw IOException("Failed to write Paimon manifest list file: " +
-			                  (result ? result->GetError() : "unknown error"));
-		}
+		vector<Value> row;
+		row.push_back(Value(manifest_filename));
+		row.push_back(Value::BIGINT(manifest_file_size));
+		row.push_back(Value::BIGINT((int64_t)written_files.size()));
+		row.push_back(Value::BIGINT(0));
+		row.push_back(SimpleStatsValue());
+		row.push_back(Value::BIGINT(0));
+		PaimonAvroWriter::WriteFile(context, manifest_list_path, ManifestListSchemaJson(), {row});
 	}
 
 	// Get manifest list file size
@@ -385,14 +423,9 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		}
 	}
 
-	const char *PARTITION_STATS_STRUCT =
-	    "{'_MIN_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-	    "'_MAX_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
-	    "'_NULL_COUNTS': CAST([] AS BIGINT[])}";
-
-	// Step 2b: Build the BASE manifest list = all manifests carried forward from the previous
-	// snapshot (its base + delta). Without this, each commit would only expose its own delta and
-	// previously-written data would vanish. For the first snapshot the base list is empty.
+	// Step 2b: Write the BASE manifest list = all manifests carried forward from the previous snapshot
+	// (its base + delta). Without this, each commit would only expose its own delta and prior data
+	// would vanish. For the first snapshot (or compaction) the base list is empty.
 	string base_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 1);
 	{
 		vector<PaimonManifestFileMeta> carried;
@@ -422,32 +455,18 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 			}
 		}
 
-		string list_sql;
-		if (carried.empty()) {
-			list_sql = "SELECT CAST('' AS VARCHAR) AS _FILE_NAME, CAST(0 AS BIGINT) AS _FILE_SIZE, "
-			           "CAST(0 AS BIGINT) AS _NUM_ADDED_FILES, CAST(0 AS BIGINT) AS _NUM_DELETED_FILES, " +
-			           string(PARTITION_STATS_STRUCT) + " AS _PARTITION_STATS, CAST(0 AS BIGINT) AS _SCHEMA_ID "
-			           "WHERE 1=0";
-		} else {
-			for (idx_t i = 0; i < carried.size(); i++) {
-				auto &m = carried[i];
-				if (i > 0) {
-					list_sql += " UNION ALL ";
-				}
-				list_sql += "SELECT '" + m.file_name + "' AS _FILE_NAME, " +
-				            "CAST(" + std::to_string(m.file_size) + " AS BIGINT) AS _FILE_SIZE, " +
-				            "CAST(" + std::to_string(m.num_added_files) + " AS BIGINT) AS _NUM_ADDED_FILES, " +
-				            "CAST(" + std::to_string(m.num_deleted_files) + " AS BIGINT) AS _NUM_DELETED_FILES, " +
-				            string(PARTITION_STATS_STRUCT) + " AS _PARTITION_STATS, " +
-				            "CAST(" + std::to_string(m.schema_id) + " AS BIGINT) AS _SCHEMA_ID";
-			}
+		vector<vector<Value>> base_rows;
+		for (auto &m : carried) {
+			vector<Value> row;
+			row.push_back(Value(m.file_name));
+			row.push_back(Value::BIGINT(m.file_size));
+			row.push_back(Value::BIGINT(m.num_added_files));
+			row.push_back(Value::BIGINT(m.num_deleted_files));
+			row.push_back(SimpleStatsValue());
+			row.push_back(Value::BIGINT(m.schema_id));
+			base_rows.push_back(std::move(row));
 		}
-		string copy_sql = "COPY (" + list_sql + ") TO '" + base_list_path + "' (FORMAT AVRO)";
-		auto result = conn.Query(copy_sql);
-		if (!result || result->HasError()) {
-			throw IOException("Failed to write Paimon base manifest list file: " +
-			                  (result ? result->GetError() : "unknown error"));
-		}
+		PaimonAvroWriter::WriteFile(context, base_list_path, ManifestListSchemaJson(), base_rows);
 	}
 	string base_list_filename = base_list_path;
 	{

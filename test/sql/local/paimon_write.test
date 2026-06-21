@@ -5,8 +5,6 @@
 # are also verified to be readable by pypaimon (the reference implementation) in the cross-engine
 # checks under scripts/ — here we assert the in-engine round trip.
 
-require avro
-
 require parquet
 
 statement ok

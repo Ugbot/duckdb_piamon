@@ -94,6 +94,7 @@ set(PAIMON_EXTENSION_SOURCES
     src/paimon_manifest.cpp
     src/paimon_avro_scan.cpp
     src/paimon_avro_reader.cpp
+    src/paimon_avro_writer.cpp
     src/paimon_binary_row.cpp
     # Shared utilities (IcebergUtils::FileToString, GetStorageLocation, etc.)
     src/common/utils.cpp

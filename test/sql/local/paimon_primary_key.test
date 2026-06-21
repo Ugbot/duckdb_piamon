@@ -6,8 +6,6 @@
 # are validated against pypaimon's own reader (the authoritative Paimon implementation).
 # Generate fixtures with: make paimon_data
 
-require avro
-
 require parquet
 
 require-env DUCKDB_PAIMON_HAVE_GENERATED_DATA
