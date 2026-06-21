@@ -19,6 +19,10 @@ public:
     TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                   const EntryLookupInfo &lookup_info) override;
     TableStorageInfo GetStorageInfo(ClientContext &context) override;
+    //! The row-id virtual column carries the primary key (so DELETE/UPDATE identify rows by key):
+    //! the key column's type for a single-column PK, or a STRUCT of the key columns for a composite
+    //! PK. Falls back to BIGINT (a row sequence) when there is no primary key.
+    virtual_column_map_t GetVirtualColumns() const override;
 
     // Table info
     string GetTablePath() const { return table_path; }

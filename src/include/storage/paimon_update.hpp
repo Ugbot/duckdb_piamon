@@ -13,8 +13,9 @@ namespace duckdb {
 class PaimonUpdate : public PhysicalOperator {
 public:
 	PaimonUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &table, idx_t row_id_index,
-	             string table_path, string pk_name, vector<string> value_names, vector<LogicalType> value_types,
-	             vector<string> updated_columns, vector<idx_t> updated_child_indexes, idx_t estimated_cardinality);
+	             string table_path, vector<string> pk_names, vector<string> value_names,
+	             vector<LogicalType> value_types, vector<string> updated_columns, vector<idx_t> updated_child_indexes,
+	             idx_t estimated_cardinality);
 
 public:
 	bool IsSink() const override {
@@ -36,7 +37,7 @@ public:
 	TableCatalogEntry &table;
 	idx_t row_id_index;
 	string table_path;
-	string pk_name;
+	vector<string> pk_names;
 	vector<string> value_names;
 	vector<LogicalType> value_types;
 	vector<string> updated_columns;       //! names of the columns being SET

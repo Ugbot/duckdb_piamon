@@ -120,9 +120,8 @@ PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlan
                                              PhysicalOperator &plan) {
 	auto &paimon_table = op.table.Cast<PaimonTableEntry>();
 	auto &metadata = paimon_table.GetMetadata();
-	if (!metadata.schema || metadata.schema->primary_keys.size() != 1) {
-		throw NotImplementedException(
-		    "UPDATE on Paimon tables is currently supported only for single primary-key tables");
+	if (!metadata.schema || metadata.schema->primary_keys.empty()) {
+		throw NotImplementedException("UPDATE on Paimon tables requires a primary-key table");
 	}
 	auto names = op.table.GetColumns().GetColumnNames();
 	auto types = op.table.GetColumns().GetColumnTypes();
@@ -141,7 +140,7 @@ PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlan
 	}
 
 	auto &upd = planner.Make<PaimonUpdate>(op.types, op.table, 0, paimon_table.GetTablePath(),
-	                                       metadata.schema->primary_keys[0], names, types, updated_columns,
+	                                       metadata.schema->primary_keys, names, types, updated_columns,
 	                                       updated_child_indexes, op.estimated_cardinality);
 	upd.children.push_back(plan);
 	return upd;
@@ -151,9 +150,8 @@ PhysicalOperator &PaimonCatalog::PlanDelete(ClientContext &context, PhysicalPlan
                                              PhysicalOperator &plan) {
 	auto &paimon_table = op.table.Cast<PaimonTableEntry>();
 	auto &metadata = paimon_table.GetMetadata();
-	if (!metadata.schema || metadata.schema->primary_keys.size() != 1) {
-		throw NotImplementedException(
-		    "DELETE on Paimon tables is currently supported only for single primary-key tables");
+	if (!metadata.schema || metadata.schema->primary_keys.empty()) {
+		throw NotImplementedException("DELETE on Paimon tables requires a primary-key table");
 	}
 	// The bound row-id expression locates the key column produced by the child scan.
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();

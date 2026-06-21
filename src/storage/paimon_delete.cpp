@@ -21,23 +21,48 @@ PaimonDelete::PaimonDelete(PhysicalPlan &physical_plan, vector<LogicalType> type
 
 class PaimonDeleteGlobalState : public GlobalSinkState {
 public:
-	explicit PaimonDeleteGlobalState(ClientContext &context)
-	    : keys(context, vector<LogicalType> {LogicalType::BIGINT}), delete_count(0) {
+	PaimonDeleteGlobalState(ClientContext &context, const vector<LogicalType> &key_types)
+	    : keys(context, key_types), delete_count(0) {
 	}
-	ColumnDataCollection keys; //! buffered primary-key values of deleted rows
+	ColumnDataCollection keys; //! buffered primary-key values (one column per key column) of deletes
 	idx_t delete_count;
 };
 
+// Types of the primary-key columns, in pk order.
+static vector<LogicalType> KeyTypes(const vector<string> &pk_names, const vector<string> &value_names,
+                                    const vector<LogicalType> &value_types) {
+	vector<LogicalType> result;
+	for (auto &pk : pk_names) {
+		for (idx_t i = 0; i < value_names.size(); i++) {
+			if (StringUtil::CIEquals(value_names[i], pk)) {
+				result.push_back(value_types[i]);
+				break;
+			}
+		}
+	}
+	return result;
+}
+
 unique_ptr<GlobalSinkState> PaimonDelete::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<PaimonDeleteGlobalState>(context);
+	return make_uniq<PaimonDeleteGlobalState>(context, KeyTypes(pk_names, value_names, value_types));
 }
 
 SinkResultType PaimonDelete::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<PaimonDeleteGlobalState>();
-	// The row-id column carries the primary-key value (see paimon_scan rowid emission).
+	// The row-id column carries the primary key: a scalar for a single-column PK, a STRUCT of the key
+	// columns for a composite PK (see paimon_scan rowid emission).
+	auto key_types = KeyTypes(pk_names, value_names, value_types);
 	DataChunk keys;
-	keys.InitializeEmpty(vector<LogicalType> {LogicalType::BIGINT});
-	keys.data[0].Reference(chunk.data[row_id_index]);
+	keys.InitializeEmpty(key_types);
+	auto &rid = chunk.data[row_id_index];
+	if (pk_names.size() == 1) {
+		keys.data[0].Reference(rid);
+	} else {
+		auto &entries = StructVector::GetEntries(rid);
+		for (idx_t j = 0; j < pk_names.size(); j++) {
+			keys.data[j].Reference(*entries[j]);
+		}
+	}
 	keys.SetCardinality(chunk.size());
 	gstate.keys.Append(keys);
 	gstate.delete_count += chunk.size();
@@ -90,9 +115,15 @@ SinkFinalizeType PaimonDelete::Finalize(Pipeline &pipeline, Event &event, Client
 		}
 	}
 
-	// Stage the deleted keys, then COPY out tombstone rows: _KEY_<pk>, _SEQUENCE_NUMBER,
-	// _VALUE_KIND = 3 (DELETE), the pk value column, and NULL for the remaining value columns.
-	if (auto r = conn.Query("CREATE TEMP TABLE __paimon_del_keys (k BIGINT)"); r && r->HasError()) {
+	// Stage the deleted keys (one column per key column), then COPY out tombstone rows: _KEY_<pk>,
+	// _SEQUENCE_NUMBER, _VALUE_KIND = 3 (DELETE), the pk value columns, NULL for the rest.
+	auto key_types = KeyTypes(pk_names, value_names, value_types);
+	auto key_col = [&](idx_t j) { return "k" + std::to_string(j); };
+	string stage_cols;
+	for (idx_t j = 0; j < pk_names.size(); j++) {
+		stage_cols += (j ? ", " : "") + key_col(j) + " " + key_types[j].ToString();
+	}
+	if (auto r = conn.Query("CREATE TEMP TABLE __paimon_del_keys (" + stage_cols + ")"); r && r->HasError()) {
 		throw IOException("Failed to stage Paimon delete keys: " + r->GetError());
 	}
 	{
@@ -103,13 +134,24 @@ SinkFinalizeType PaimonDelete::Finalize(Pipeline &pipeline, Event &event, Client
 		appender.Close();
 	}
 
-	const string &pk = pk_names[0];
-	string projection = QId(pk) + " AS " + QId("_KEY_" + pk) + ", ";
+	auto key_index = [&](const string &col) -> int {
+		for (idx_t j = 0; j < pk_names.size(); j++) {
+			if (StringUtil::CIEquals(pk_names[j], col)) {
+				return (int)j;
+			}
+		}
+		return -1;
+	};
+	string projection;
+	for (idx_t j = 0; j < pk_names.size(); j++) {
+		projection += key_col(j) + " AS " + QId("_KEY_" + pk_names[j]) + ", ";
+	}
 	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
 	projection += "CAST(3 AS TINYINT) AS \"_VALUE_KIND\"";
 	for (idx_t i = 0; i < value_names.size(); i++) {
-		if (StringUtil::CIEquals(value_names[i], pk)) {
-			projection += ", " + QId(pk) + " AS " + QId(value_names[i]);
+		int j = key_index(value_names[i]);
+		if (j >= 0) {
+			projection += ", " + key_col(j) + " AS " + QId(value_names[i]);
 		} else {
 			projection += ", CAST(NULL AS " + value_types[i].ToString() + ") AS " + QId(value_names[i]);
 		}
@@ -117,8 +159,8 @@ SinkFinalizeType PaimonDelete::Finalize(Pipeline &pipeline, Event &event, Client
 
 	string uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	string data_file = bucket_dir + "/data-" + uuid + "-0.parquet";
-	string copy_sql = "COPY (SELECT " + projection + " FROM (SELECT k AS " + QId(pk) +
-	                  " FROM __paimon_del_keys)) TO '" + data_file + "' (FORMAT PARQUET)";
+	string copy_sql =
+	    "COPY (SELECT " + projection + " FROM __paimon_del_keys) TO '" + data_file + "' (FORMAT PARQUET)";
 	if (auto r = conn.Query(copy_sql); r && r->HasError()) {
 		conn.Query("DROP TABLE __paimon_del_keys");
 		throw IOException("Failed to write Paimon delete tombstones: " + r->GetError());

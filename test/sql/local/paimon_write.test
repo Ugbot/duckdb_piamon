@@ -125,6 +125,26 @@ SELECT files_compacted FROM paimon_compact('__TEST_DIR__/pk_w');
 ----
 0
 
+# --- Composite primary key: INSERT/upsert, DELETE, UPDATE identify rows by the full key. ---
+statement ok
+CREATE TABLE pm.ck (k1 BIGINT, k2 BIGINT, v VARCHAR, PRIMARY KEY (k1, k2));
+
+statement ok
+INSERT INTO pm.ck VALUES (1,1,'a'),(1,2,'b'),(2,1,'c'),(2,2,'d');
+
+statement ok
+DELETE FROM pm.ck WHERE k1 = 1 AND k2 = 2;
+
+statement ok
+UPDATE pm.ck SET v = 'C2' WHERE k1 = 2 AND k2 = 1;
+
+query III
+SELECT k1, k2, v FROM pm.ck ORDER BY k1, k2;
+----
+1	1	a
+2	1	C2
+2	2	d
+
 # --- CREATE TABLE AS: create + populate from a query in one statement. ---
 statement ok
 CREATE TABLE pm.ctas_t AS SELECT i AS id, 'v' || i AS v FROM range(5) t(i);

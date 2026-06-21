@@ -12,13 +12,28 @@
 namespace duckdb {
 
 PaimonUpdate::PaimonUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, TableCatalogEntry &table,
-                           idx_t row_id_index, string table_path, string pk_name, vector<string> value_names,
+                           idx_t row_id_index, string table_path, vector<string> pk_names, vector<string> value_names,
                            vector<LogicalType> value_types, vector<string> updated_columns,
                            vector<idx_t> updated_child_indexes, idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-      table(table), row_id_index(row_id_index), table_path(std::move(table_path)), pk_name(std::move(pk_name)),
+      table(table), row_id_index(row_id_index), table_path(std::move(table_path)), pk_names(std::move(pk_names)),
       value_names(std::move(value_names)), value_types(std::move(value_types)),
       updated_columns(std::move(updated_columns)), updated_child_indexes(std::move(updated_child_indexes)) {
+}
+
+// Types of the primary-key columns, in pk order.
+static vector<LogicalType> UpdateKeyTypes(const vector<string> &pk_names, const vector<string> &value_names,
+                                          const vector<LogicalType> &value_types) {
+	vector<LogicalType> result;
+	for (auto &pk : pk_names) {
+		for (idx_t i = 0; i < value_names.size(); i++) {
+			if (StringUtil::CIEquals(value_names[i], pk)) {
+				result.push_back(value_types[i]);
+				break;
+			}
+		}
+	}
+	return result;
 }
 
 static string QId(const string &n) {
@@ -34,13 +49,12 @@ public:
 	PaimonUpdateGlobalState(ClientContext &context, const vector<LogicalType> &buffer_types)
 	    : buffered(context, buffer_types), update_count(0) {
 	}
-	ColumnDataCollection buffered; //! [pk, updated_col_0, updated_col_1, ...]
+	ColumnDataCollection buffered; //! [key_0..key_{K-1}, updated_col_0, updated_col_1, ...]
 	idx_t update_count;
 };
 
 unique_ptr<GlobalSinkState> PaimonUpdate::GetGlobalSinkState(ClientContext &context) const {
-	vector<LogicalType> buffer_types;
-	buffer_types.push_back(LogicalType::BIGINT); // pk (row id)
+	vector<LogicalType> buffer_types = UpdateKeyTypes(pk_names, value_names, value_types); // key columns
 	for (auto &uc : updated_columns) {
 		for (idx_t i = 0; i < value_names.size(); i++) {
 			if (StringUtil::CIEquals(value_names[i], uc)) {
@@ -54,16 +68,25 @@ unique_ptr<GlobalSinkState> PaimonUpdate::GetGlobalSinkState(ClientContext &cont
 
 SinkResultType PaimonUpdate::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<PaimonUpdateGlobalState>();
-	vector<LogicalType> buffer_types;
-	buffer_types.push_back(LogicalType::BIGINT);
+	idx_t nkeys = pk_names.size();
+	vector<LogicalType> buffer_types = UpdateKeyTypes(pk_names, value_names, value_types);
 	for (auto idx : updated_child_indexes) {
 		buffer_types.push_back(chunk.data[idx].GetType());
 	}
 	DataChunk buf;
 	buf.InitializeEmpty(buffer_types);
-	buf.data[0].Reference(chunk.data[chunk.ColumnCount() - 1]); // row id (= pk) is the last column
+	// The row id (last child column) carries the key: scalar for single PK, STRUCT for composite.
+	auto &rid = chunk.data[chunk.ColumnCount() - 1];
+	if (nkeys == 1) {
+		buf.data[0].Reference(rid);
+	} else {
+		auto &entries = StructVector::GetEntries(rid);
+		for (idx_t j = 0; j < nkeys; j++) {
+			buf.data[j].Reference(*entries[j]);
+		}
+	}
 	for (idx_t j = 0; j < updated_child_indexes.size(); j++) {
-		buf.data[j + 1].Reference(chunk.data[updated_child_indexes[j]]);
+		buf.data[nkeys + j].Reference(chunk.data[updated_child_indexes[j]]);
 	}
 	buf.SetCardinality(chunk.size());
 	gstate.buffered.Append(buf);
@@ -107,8 +130,13 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 		}
 	}
 
-	// Stage buffered (pk, updated values) into a temp table: pk, u0, u1, ...
-	string stage_cols = "pk BIGINT";
+	// Stage buffered (key cols, updated values) into a temp table: k0..k{K-1}, u0, u1, ...
+	auto key_types = UpdateKeyTypes(pk_names, value_names, value_types);
+	auto key_col = [&](idx_t j) { return "k" + std::to_string(j); };
+	string stage_cols;
+	for (idx_t j = 0; j < pk_names.size(); j++) {
+		stage_cols += (j ? ", " : "") + key_col(j) + " " + key_types[j].ToString();
+	}
 	for (idx_t j = 0; j < updated_columns.size(); j++) {
 		string t = "VARCHAR";
 		for (idx_t i = 0; i < value_names.size(); i++) {
@@ -130,7 +158,14 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 		appender.Close();
 	}
 
-	// New full row per matched key: take the current row (via paimon_scan), overwrite SET columns.
+	auto pk_index = [&](const string &col) -> int {
+		for (idx_t j = 0; j < pk_names.size(); j++) {
+			if (StringUtil::CIEquals(pk_names[j], col)) {
+				return (int)j;
+			}
+		}
+		return -1;
+	};
 	auto updated_index = [&](const string &col) -> int {
 		for (idx_t j = 0; j < updated_columns.size(); j++) {
 			if (StringUtil::CIEquals(updated_columns[j], col)) {
@@ -139,7 +174,11 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 		}
 		return -1;
 	};
-	string projection = "c." + QId(pk_name) + " AS " + QId("_KEY_" + pk_name) + ", ";
+	// New full row per matched key: current row (via paimon_scan), with SET columns overwritten.
+	string projection;
+	for (idx_t j = 0; j < pk_names.size(); j++) {
+		projection += "c." + QId(pk_names[j]) + " AS " + QId("_KEY_" + pk_names[j]) + ", ";
+	}
 	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
 	projection += "CAST(0 AS TINYINT) AS \"_VALUE_KIND\"";
 	for (auto &vn : value_names) {
@@ -151,10 +190,14 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 		}
 	}
 
+	string join_cond;
+	for (idx_t j = 0; j < pk_names.size(); j++) {
+		join_cond += (j ? " AND " : "") + ("c." + QId(pk_names[j]) + " = u." + key_col(j));
+	}
 	string uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	string data_file = bucket_dir + "/data-" + uuid + "-0.parquet";
-	string copy_sql = "COPY (SELECT " + projection + " FROM paimon_scan('" + table_path + "') c JOIN __paimon_upd u ON c." +
-	                  QId(pk_name) + " = u.pk) TO '" + data_file + "' (FORMAT PARQUET)";
+	string copy_sql = "COPY (SELECT " + projection + " FROM paimon_scan('" + table_path + "') c JOIN __paimon_upd u ON " +
+	                  join_cond + ") TO '" + data_file + "' (FORMAT PARQUET)";
 	if (auto r = conn.Query(copy_sql); r && r->HasError()) {
 		conn.Query("DROP TABLE __paimon_upd");
 		throw IOException("Failed to write Paimon update rows: " + r->GetError());

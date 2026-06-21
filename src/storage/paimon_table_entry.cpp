@@ -60,4 +60,31 @@ TableStorageInfo PaimonTableEntry::GetStorageInfo(ClientContext &context) {
 	return result;
 }
 
+virtual_column_map_t PaimonTableEntry::GetVirtualColumns() const {
+	LogicalType rowid_type = LogicalType::ROW_TYPE; // default (BIGINT row sequence) when no PK
+	if (metadata && metadata->schema && !metadata->schema->primary_keys.empty()) {
+		auto &pks = metadata->schema->primary_keys;
+		auto type_of = [&](const string &col) {
+			for (auto &f : metadata->schema->fields) {
+				if (f.name == col) {
+					return PaimonTypeToLogicalType(f.type);
+				}
+			}
+			return LogicalType(LogicalType::BIGINT);
+		};
+		if (pks.size() == 1) {
+			rowid_type = type_of(pks[0]);
+		} else {
+			child_list_t<LogicalType> kids;
+			for (auto &pk : pks) {
+				kids.emplace_back(pk, type_of(pk));
+			}
+			rowid_type = LogicalType::STRUCT(std::move(kids));
+		}
+	}
+	virtual_column_map_t result;
+	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type)));
+	return result;
+}
+
 } // namespace duckdb
