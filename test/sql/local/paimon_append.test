@@ -65,6 +65,36 @@ SELECT id, b FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/defau
 2	20
 3	30
 
+# --- Filter pushdown: predicates are translated into the inner parquet scan to prune row groups,
+# while the full filter is still re-applied above the scan (results must be exact). ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE dt = '2024-01-01';
+----
+17
+
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE dt IN ('2024-01-01', '2024-01-02');
+----
+34
+
+# OR across a value and a partition column (an OR must be applied whole or not at all in the prune).
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE val < 100 OR dt = '2024-01-03';
+----
+21
+
+# Range + AND on value columns.
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE val >= 0 AND val < 100;
+----
+6
+
+# A pushed predicate that matches nothing still returns the correct (empty) result.
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE dt = '1999-01-01';
+----
+0
+
 # --- Catalog ATTACH + catalog-integrated scan ---
 statement ok
 ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);

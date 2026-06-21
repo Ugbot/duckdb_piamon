@@ -15,6 +15,12 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
@@ -68,6 +74,12 @@ struct PaimonScanBindData : public TableFunctionData {
 	//! for a single-column PK, a STRUCT for a composite PK) so catalog DELETE/UPDATE identify rows
 	//! by key. Empty when there is no primary key.
 	vector<idx_t> rowid_pk_indexes;
+	//! Best-effort SQL predicate translated from the query's WHERE clause (set by
+	//! pushdown_complex_filter). It is injected as an extra WHERE over the inner read_parquet query
+	//! purely so the parquet reader can prune row groups; it is NOT relied on for correctness — the
+	//! filter expressions are left in place above the scan, so DuckDB always re-applies the full
+	//! predicate. Anything not safely translatable is simply omitted.
+	mutable string pushdown_where;
 };
 
 struct PaimonScanGlobalState : public GlobalTableFunctionState {
@@ -255,6 +267,169 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	return std::move(result);
 }
 
+// SQL operator symbol for a binary comparison; nullptr for anything else.
+static const char *ComparisonOpSql(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return " = ";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return " <> ";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return " < ";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return " > ";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return " <= ";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return " >= ";
+	default:
+		return nullptr;
+	}
+}
+
+// Recursively translate a bound filter expression into a SQL predicate string, returning "" when it
+// (or a required sub-part) cannot be exactly represented. The result is only used to prune the inner
+// parquet scan; the original predicate stays above the scan so correctness never depends on this.
+// Over-approximation is therefore safe for AND (drop untranslatable conjuncts → wider result), but an
+// OR must be abandoned entirely if any branch is untranslatable (a partial OR would wrongly drop rows).
+static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
+                                  const case_insensitive_set_t &valid_names) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &col = expr.Cast<BoundColumnRefExpression>();
+		// binding.column_index indexes into the get's projected column list, not the full schema:
+		// resolve it through GetColumnIds() to the schema position, then to the column name. A
+		// virtual/row-id column has a primary index past the real columns and is skipped.
+		auto idx = col.binding.column_index;
+		auto &col_ids = get.GetColumnIds();
+		if (idx >= col_ids.size()) {
+			return "";
+		}
+		auto prim = col_ids[idx].GetPrimaryIndex();
+		if (prim >= get.names.size()) {
+			return "";
+		}
+		const string &name = get.names[prim];
+		if (valid_names.find(name) == valid_names.end()) {
+			return "";
+		}
+		return QuoteIdentifier(name);
+	}
+	case ExpressionClass::BOUND_CONSTANT: {
+		auto &c = expr.Cast<BoundConstantExpression>();
+		if (c.value.IsNull()) {
+			return ""; // NULL comparisons are three-valued; leave them to DuckDB
+		}
+		return c.value.ToSQLString();
+	}
+	case ExpressionClass::BOUND_COMPARISON: {
+		auto &cmp = expr.Cast<BoundComparisonExpression>();
+		auto op = ComparisonOpSql(cmp.type);
+		if (!op) {
+			return "";
+		}
+		string l = TranslateFilterExpr(*cmp.left, get, valid_names);
+		string r = TranslateFilterExpr(*cmp.right, get, valid_names);
+		if (l.empty() || r.empty()) {
+			return "";
+		}
+		return "(" + l + op + r + ")";
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+			if (op.children.size() != 1) {
+				return "";
+			}
+			string c = TranslateFilterExpr(*op.children[0], get, valid_names);
+			if (c.empty()) {
+				return "";
+			}
+			return "(" + c + (expr.type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)" : " IS NOT NULL)");
+		}
+		if (expr.type == ExpressionType::COMPARE_IN || expr.type == ExpressionType::COMPARE_NOT_IN) {
+			if (op.children.size() < 2) {
+				return "";
+			}
+			string col = TranslateFilterExpr(*op.children[0], get, valid_names);
+			if (col.empty()) {
+				return "";
+			}
+			string list;
+			for (idx_t i = 1; i < op.children.size(); i++) {
+				if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					return ""; // only constant IN-lists translate cleanly
+				}
+				auto &cv = op.children[i]->Cast<BoundConstantExpression>();
+				if (cv.value.IsNull()) {
+					return "";
+				}
+				list += (i > 1 ? ", " : "") + cv.value.ToSQLString();
+			}
+			return "(" + col + (expr.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") + list + "))";
+		}
+		return "";
+	}
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		bool is_and = (expr.type == ExpressionType::CONJUNCTION_AND);
+		vector<string> parts;
+		for (auto &child : conj.children) {
+			string c = TranslateFilterExpr(*child, get, valid_names);
+			if (c.empty()) {
+				if (is_and) {
+					continue; // dropping an AND conjunct only widens the result — safe
+				}
+				return ""; // an OR with an untranslatable branch cannot be partially applied
+			}
+			parts.push_back(std::move(c));
+		}
+		if (parts.empty()) {
+			return "";
+		}
+		if (parts.size() == 1) {
+			return parts[0];
+		}
+		string joined = "(";
+		for (idx_t i = 0; i < parts.size(); i++) {
+			joined += (i ? (is_and ? " AND " : " OR ") : "") + parts[i];
+		}
+		joined += ")";
+		return joined;
+	}
+	default:
+		return "";
+	}
+}
+
+// Predicate pushdown: translate the query's WHERE conjuncts into a SQL predicate that is injected over
+// the inner read_parquet query so the parquet reader can skip row groups. The filters are deliberately
+// left in `filters` (not consumed), so DuckDB re-applies the full predicate above the scan and this
+// remains a pure performance hint — anything we cannot translate exactly is simply skipped.
+static void PaimonScanComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                            vector<unique_ptr<Expression>> &filters) {
+	auto &bind_data = bind_data_p->Cast<PaimonScanBindData>();
+	if (filters.empty() || bind_data.sql.empty()) {
+		return;
+	}
+	case_insensitive_set_t valid_names(bind_data.names.begin(), bind_data.names.end());
+	vector<string> terms;
+	for (auto &f : filters) {
+		string t = TranslateFilterExpr(*f, get, valid_names);
+		if (!t.empty()) {
+			terms.push_back(std::move(t));
+		}
+	}
+	if (terms.empty()) {
+		return;
+	}
+	string where;
+	for (idx_t i = 0; i < terms.size(); i++) {
+		where += (i ? " AND " : "") + terms[i];
+	}
+	bind_data.pushdown_where = std::move(where);
+}
+
 static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &context,
                                                                  TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PaimonScanBindData>();
@@ -263,9 +438,15 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
 	if (bind_data.sql.empty()) {
 		return std::move(state); // no files → no rows
 	}
-	// Execute on a fresh connection so we don't re-enter the binding context.
+	// Execute on a fresh connection so we don't re-enter the binding context. If a predicate was
+	// pushed down, wrap the query so the parquet reader prunes row groups (a pure optimization; the
+	// full filter is still applied by the calling query).
+	string query = bind_data.sql;
+	if (!bind_data.pushdown_where.empty()) {
+		query = "SELECT * FROM (" + query + ") AS _paimon_pushdown WHERE " + bind_data.pushdown_where;
+	}
 	state->conn = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
-	auto pending = state->conn->Query(bind_data.sql);
+	auto pending = state->conn->Query(query);
 	if (pending->HasError()) {
 		throw IOException("Paimon scan failed: " + pending->GetError());
 	}
@@ -320,6 +501,7 @@ TableFunctionSet PaimonFunctions::GetPaimonScanFunction(ExtensionLoader &loader)
 	TableFunction scan({LogicalType::VARCHAR}, PaimonScanExec, PaimonScanBind, PaimonScanInitGlobal);
 	scan.name = "paimon_scan";
 	scan.projection_pushdown = true;
+	scan.pushdown_complex_filter = PaimonScanComplexFilterPushdown;
 	AddPaimonNamedParameters(scan);
 	set.AddFunction(scan);
 	return set;
