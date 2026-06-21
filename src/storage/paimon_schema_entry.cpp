@@ -302,7 +302,24 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::LookupEntry(CatalogTransaction tra
 }
 
 void PaimonSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	throw CatalogException("DROP not yet supported for Paimon catalog");
+	if (info.type != CatalogType::TABLE_ENTRY) {
+		throw CatalogException("Paimon catalog only supports dropping tables");
+	}
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>();
+	string table_path = paimon_catalog.GetDBPath() + "/" + info.name;
+
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	if (!fs.DirectoryExists(table_path)) {
+		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+			return;
+		}
+		throw CatalogException("Table '%s' does not exist in Paimon catalog", info.name);
+	}
+
+	// Remove the table directory and drop it from the in-memory cache.
+	fs.RemoveDirectory(table_path);
+	lock_guard<mutex> guard(entry_lock);
+	tables.erase(info.name);
 }
 
 void PaimonSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {

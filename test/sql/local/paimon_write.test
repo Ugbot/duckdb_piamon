@@ -50,5 +50,13 @@ SELECT snapshot_id, commit_kind FROM paimon_snapshots('__TEST_DIR__/paimon_write
 1	APPEND
 2	APPEND
 
+# DROP removes the table from the catalog and deletes its directory.
+statement ok
+DROP TABLE pm.paimon_write_t;
+
+statement error
+SELECT count(*) FROM pm.paimon_write_t;
+----
+
 statement ok
 DETACH pm;
