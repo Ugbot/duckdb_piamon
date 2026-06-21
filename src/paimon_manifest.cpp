@@ -1,6 +1,6 @@
 #include "paimon_manifest.hpp"
+#include "paimon_avro_scan.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/query_result.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -27,16 +27,9 @@ static idx_t FindColumn(const vector<string> &names, const string &target) {
 vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, const string &manifest_list_path) {
 	vector<PaimonManifestFileMeta> result;
 
-	// Read the Avro file using DuckDB's read_avro function
-	string query = "SELECT * FROM read_avro('" + manifest_list_path + "')";
-	auto query_result = context.Query(query, false);
-
-	if (!query_result || query_result->HasError()) {
-		throw IOException("Failed to read Paimon manifest list: " + manifest_list_path +
-		                  (query_result ? " - " + query_result->GetError() : ""));
-	}
-
-	auto &names = query_result->names;
+	// Read the Avro file natively via the read_avro table function (no nested SQL — see PaimonAvroScan).
+	PaimonAvroScan scan("paimon_manifest_list", context, manifest_list_path);
+	auto &names = scan.GetNames();
 
 	// Map column names to indices
 	idx_t file_name_idx = FindColumn(names, "_FILE_NAME");
@@ -50,12 +43,14 @@ vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, co
 	}
 
 	// Fetch all chunks
+	DataChunk chunk_storage;
+	scan.InitializeChunk(chunk_storage);
 	while (true) {
-		auto chunk = query_result->Fetch();
-		if (!chunk || chunk->size() == 0) {
+		chunk_storage.Reset();
+		if (!scan.GetNext(chunk_storage)) {
 			break;
 		}
-
+		DataChunk *chunk = &chunk_storage;
 		for (idx_t row = 0; row < chunk->size(); row++) {
 			PaimonManifestFileMeta meta;
 			meta.file_name = chunk->GetValue(file_name_idx, row).ToString();
@@ -99,16 +94,9 @@ vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, co
 vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context, const string &manifest_file_path) {
 	vector<PaimonManifestEntryParsed> result;
 
-	// Read the Avro file using DuckDB's read_avro function
-	string query = "SELECT * FROM read_avro('" + manifest_file_path + "')";
-	auto query_result = context.Query(query, false);
-
-	if (!query_result || query_result->HasError()) {
-		throw IOException("Failed to read Paimon manifest file: " + manifest_file_path +
-		                  (query_result ? " - " + query_result->GetError() : ""));
-	}
-
-	auto &names = query_result->names;
+	// Read the Avro file natively via the read_avro table function (no nested SQL — see PaimonAvroScan).
+	PaimonAvroScan scan("paimon_manifest_file", context, manifest_file_path);
+	auto &names = scan.GetNames();
 
 	// Map column names to indices
 	idx_t kind_idx = FindColumn(names, "_KIND");
@@ -121,12 +109,14 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 	}
 
 	// Fetch all chunks
+	DataChunk chunk_storage;
+	scan.InitializeChunk(chunk_storage);
 	while (true) {
-		auto chunk = query_result->Fetch();
-		if (!chunk || chunk->size() == 0) {
+		chunk_storage.Reset();
+		if (!scan.GetNext(chunk_storage)) {
 			break;
 		}
-
+		DataChunk *chunk = &chunk_storage;
 		for (idx_t row = 0; row < chunk->size(); row++) {
 			PaimonManifestEntryParsed entry;
 

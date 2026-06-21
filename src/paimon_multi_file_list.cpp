@@ -42,9 +42,21 @@ void PaimonMultiFileList::DiscoverDataFiles() {
 			try {
 				files = ComputeActiveDataFiles(context, path, snapshot->base_manifest_list,
 				                               snapshot->delta_manifest_list);
-				if (!files.empty()) {
+				// Validate that every resolved file actually exists. For partitioned tables the
+				// partition directory (e.g. dt=.../) is encoded in the manifest's _PARTITION BinaryRow,
+				// which is not yet decoded — so resolved paths can be wrong. In that case fall back to
+				// directory discovery rather than failing the scan. (Proper fix: Phase 2 BinaryRow decode.)
+				bool all_exist = !files.empty();
+				for (auto &f : files) {
+					if (!fs.FileExists(f)) {
+						all_exist = false;
+						break;
+					}
+				}
+				if (all_exist) {
 					return; // Manifest-based discovery succeeded
 				}
+				files.clear();
 			} catch (const std::exception &e) {
 				// Manifest reading failed — fall through to directory scanning
 			}
@@ -145,7 +157,10 @@ vector<OpenFileInfo> PaimonMultiFileList::GetAllFiles() {
 }
 
 FileExpandResult PaimonMultiFileList::GetExpandResult() {
-	if (files.size() <= 1) {
+	if (files.empty()) {
+		return FileExpandResult::NO_FILES;
+	}
+	if (files.size() == 1) {
 		return FileExpandResult::SINGLE_FILE;
 	}
 	return FileExpandResult::MULTIPLE_FILES;
@@ -156,8 +171,10 @@ idx_t PaimonMultiFileList::GetTotalFileCount() {
 }
 
 OpenFileInfo PaimonMultiFileList::GetFile(idx_t i) {
+	// Contract (see MultiFileList::Scan): return an empty OpenFileInfo once the index runs past
+	// the end of the file list, rather than throwing — this is how the scanner detects EOF.
 	if (i >= files.size()) {
-		throw InternalException("File index out of bounds");
+		return OpenFileInfo();
 	}
 	return {files[i]};
 }

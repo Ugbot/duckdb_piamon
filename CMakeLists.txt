@@ -92,6 +92,7 @@ set(PAIMON_EXTENSION_SOURCES
     src/paimon_multi_file_reader.cpp
     src/paimon_multi_file_list.cpp
     src/paimon_manifest.cpp
+    src/paimon_avro_scan.cpp
     # Shared utilities (IcebergUtils::FileToString, GetStorageLocation, etc.)
     src/common/utils.cpp
     # Paimon storage/catalog
@@ -99,6 +100,7 @@ set(PAIMON_EXTENSION_SOURCES
     src/storage/paimon_schema_entry.cpp
     src/storage/paimon_table_entry.cpp
     src/storage/paimon_insert.cpp
+    src/storage/paimon_transaction_manager.cpp
 )
 build_loadable_extension(${PAIMON_TARGET_NAME} ${PARAMETERS} ${PAIMON_EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
 

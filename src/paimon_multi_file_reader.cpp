@@ -33,15 +33,20 @@ bool PaimonMultiFileReader::Bind(MultiFileOptions &options, MultiFileList &files
 	paimon_list.Bind(return_types, names, paimon_options);
 
 	if (!return_types.empty()) {
-		// We got schema from Paimon metadata — set up column definitions
+		// We have the authoritative Paimon schema. Set up the column definitions and map data-file
+		// columns to it by name (PK tables carry extra system columns — _KEY_*, _VALUE_KIND,
+		// _SEQUENCE_NUMBER — which are simply not matched and therefore dropped here).
+		// NOTE: we must NOT delegate to MultiFileReader::Bind afterwards — it would re-derive the
+		// schema from the first data file and append it, producing duplicate columns.
 		auto &columns = bind_data.schema;
 		for (idx_t i = 0; i < names.size(); i++) {
 			columns.push_back(MultiFileColumnDefinition(names[i], return_types[i]));
 		}
 		bind_data.mapping = MultiFileColumnMappingMode::BY_NAME;
+		return true;
 	}
 
-	// Let the base class handle the rest
+	// No Paimon metadata schema available — let the base class infer from the data files.
 	return MultiFileReader::Bind(options, files, return_types, names, bind_data);
 }
 

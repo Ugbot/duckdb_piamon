@@ -15,6 +15,9 @@ public:
     // TableCatalogEntry pure virtual overrides
     unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
     TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
+    //! Resolve the paimon_scan table function bound on this table's path (catalog-integrated scan)
+    TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                  const EntryLookupInfo &lookup_info) override;
     TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
     // Table info

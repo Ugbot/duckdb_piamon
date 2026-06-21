@@ -1,6 +1,7 @@
 #include "paimon_extension.hpp"
 #include "paimon_functions.hpp"
 #include "storage/paimon_catalog.hpp"
+#include "storage/paimon_transaction_manager.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/common/exception.hpp"
@@ -17,7 +18,8 @@ namespace duckdb {
 // Paimon filesystem-based storage extension
 static unique_ptr<TransactionManager> CreatePaimonTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                      AttachedDatabase &db, Catalog &catalog) {
-	return make_uniq<DuckTransactionManager>(db);
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>();
+	return make_uniq<PaimonTransactionManager>(db, paimon_catalog);
 }
 
 class PaimonStorageExtension : public StorageExtension {

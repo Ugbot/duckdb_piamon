@@ -2,6 +2,8 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/mutex.hpp"
 
 namespace duckdb {
 
@@ -33,6 +35,15 @@ public:
 
     void DropEntry(ClientContext &context, DropInfo &info) override;
     void Alter(CatalogTransaction transaction, AlterInfo &info) override;
+
+private:
+    //! Load a Paimon table from disk (warehouse/<name>) and cache it. Returns nullptr if no such
+    //! Paimon table exists at that path.
+    optional_ptr<CatalogEntry> LoadTable(ClientContext &context, const string &table_name);
+
+    //! Owns table entries created in or loaded into this schema (filesystem catalog has no catalog set).
+    mutex entry_lock;
+    case_insensitive_map_t<unique_ptr<CatalogEntry>> tables;
 };
 
 } // namespace duckdb

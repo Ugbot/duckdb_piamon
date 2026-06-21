@@ -687,6 +687,11 @@ string PaimonTableMetadata::GetMetaDataPath(ClientContext &context, const string
 			if (fs.FileExists(latest_file)) {
 				snapshot_filename = IcebergUtils::FileToString(latest_file, fs);
 				StringUtil::Trim(snapshot_filename);
+				// The LATEST hint file holds the snapshot id (e.g. "1"), not the file name. Paimon
+				// snapshot files are named "snapshot-<id>", so normalize when only the id is present.
+				if (!snapshot_filename.empty() && snapshot_filename.find("snapshot-") != 0) {
+					snapshot_filename = "snapshot-" + snapshot_filename;
+				}
 			} else {
 				// Find the highest numbered snapshot file
 				vector<string> files;

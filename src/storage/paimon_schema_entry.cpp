@@ -15,6 +15,7 @@
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/column_definition.hpp"
 #include "paimon_metadata.hpp"
 #include <fstream>
 #include <ctime>
@@ -113,9 +114,14 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 	table_metadata->table_location = table_path;
 	table_metadata->schema = make_uniq<PaimonSchema>(schema);
 
-	// Create the table entry
+	// Create the table entry and retain ownership in this schema (filesystem catalog has no catalog set).
 	auto result = make_uniq<PaimonTableEntry>(catalog, *this, info.Base(), table_path, std::move(table_metadata));
-	return result.release();
+	auto entry_ptr = result.get();
+	{
+		lock_guard<mutex> guard(entry_lock);
+		tables[info.Base().table] = std::move(result);
+	}
+	return entry_ptr;
 }
 
 // Helper function to convert DuckDB LogicalType to PaimonDataType
@@ -232,9 +238,61 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreatePragmaFunction(CatalogTransa
 	throw CatalogException("Paimon catalog does not support pragma functions");
 }
 
+optional_ptr<CatalogEntry> PaimonSchemaEntry::LoadTable(ClientContext &context, const string &table_name) {
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>();
+	string table_path = paimon_catalog.GetDBPath() + "/" + table_name;
+
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	// A Paimon table must have a schema/ directory; the snapshot/ dir only appears after the first commit.
+	if (!fs.DirectoryExists(table_path) || !fs.DirectoryExists(table_path + "/schema")) {
+		return nullptr;
+	}
+
+	// Load metadata from the latest snapshot (or schema-only for freshly created, never-committed tables).
+	PaimonOptions options;
+	unique_ptr<PaimonTableMetadata> metadata;
+	try {
+		auto meta_path = PaimonTableMetadata::GetMetaDataPath(context, table_path, fs, options);
+		metadata = PaimonTableMetadata::Parse(meta_path, fs, options.metadata_compression_codec);
+	} catch (const std::exception &e) {
+		// No committed snapshot yet (e.g. freshly created, never-written table) — not queryable yet.
+		return nullptr;
+	}
+	if (!metadata || !metadata->schema) {
+		return nullptr;
+	}
+
+	// Build the DuckDB column list from the Paimon schema.
+	CreateTableInfo info;
+	info.schema = name;
+	info.table = table_name;
+	for (auto &field : metadata->schema->fields) {
+		info.columns.AddColumn(ColumnDefinition(field.name, PaimonTypeToLogicalType(field.type)));
+	}
+
+	auto entry = make_uniq<PaimonTableEntry>(catalog, *this, info, table_path, std::move(metadata));
+	auto entry_ptr = entry.get();
+	tables[table_name] = std::move(entry);
+	return entry_ptr;
+}
+
 optional_ptr<CatalogEntry> PaimonSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                            const EntryLookupInfo &lookup_info) {
-	return nullptr;
+	// Only tables are materialized in a Paimon catalog.
+	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	auto &table_name = lookup_info.GetEntryName();
+
+	lock_guard<mutex> guard(entry_lock);
+	auto it = tables.find(table_name);
+	if (it != tables.end()) {
+		return it->second.get();
+	}
+	if (!transaction.context) {
+		return nullptr;
+	}
+	return LoadTable(*transaction.context, table_name);
 }
 
 void PaimonSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
@@ -246,10 +304,44 @@ void PaimonSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 }
 
 void PaimonSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+	// Without a client context we can only surface entries already cached.
+	if (type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	lock_guard<mutex> guard(entry_lock);
+	for (auto &kv : tables) {
+		callback(*kv.second);
+	}
 }
 
 void PaimonSchemaEntry::Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-	Scan(type, callback);
+	if (type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	string warehouse = paimon_catalog.GetDBPath();
+
+	// Discover Paimon tables on disk (directories containing a schema/ subdir) and ensure each is loaded.
+	if (fs.DirectoryExists(warehouse)) {
+		vector<string> table_names;
+		fs.ListFiles(warehouse, [&](const string &fname, bool is_dir) {
+			if (is_dir && fs.DirectoryExists(warehouse + "/" + fname + "/schema")) {
+				table_names.push_back(fname);
+			}
+		});
+		lock_guard<mutex> guard(entry_lock);
+		for (auto &table_name : table_names) {
+			if (tables.find(table_name) == tables.end()) {
+				LoadTable(context, table_name);
+			}
+		}
+	}
+
+	lock_guard<mutex> guard(entry_lock);
+	for (auto &kv : tables) {
+		callback(*kv.second);
+	}
 }
 
 } // namespace duckdb

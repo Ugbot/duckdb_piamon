@@ -123,3 +123,5 @@ taskmanager.out
 # Performance results and reports
 /tmp/paimon_performance_results.json
 docs/
+# Paimon fixture generation venv
+.paimon-fixtures-venv/
