@@ -78,3 +78,15 @@ SELECT version, count(*) FROM pm.pk_multi GROUP BY version ORDER BY version;
 
 statement ok
 DETACH pm;
+
+# --- Tag time travel: read the table as of a named tag (tag/tag-v1 = snapshot 1). ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/tagged');
+----
+3
+
+query II
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/tagged', version => 'v1') ORDER BY id;
+----
+1	10
+2	20

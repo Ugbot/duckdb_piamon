@@ -724,6 +724,21 @@ string PaimonTableMetadata::GetMetaDataPath(ClientContext &context, const string
 				snapshot_filename = files.back();
 			}
 		} else {
+			// `version` may name a tag (Paimon stores tag/tag-<name> as a full snapshot copy) or a
+			// snapshot id. Prefer a matching tag, then fall back to snapshot-<version>.
+			string tag_path = table_location + "/tag/tag-" + options.table_version;
+			if (fs.FileExists(tag_path)) {
+				return tag_path;
+			}
+			string branch_path =
+			    table_location + "/branch/branch-" + options.table_version + "/snapshot/LATEST";
+			if (fs.FileExists(branch_path)) {
+				// A branch is a full sub-tree; resolve its latest snapshot.
+				string branch_root = table_location + "/branch/branch-" + options.table_version;
+				PaimonOptions branch_opts = options;
+				branch_opts.table_version = "latest";
+				return GetMetaDataPath(context, branch_root, fs, branch_opts);
+			}
 			snapshot_filename = "snapshot-" + options.table_version;
 		}
 		break;
@@ -766,13 +781,17 @@ unique_ptr<PaimonTableMetadata> PaimonTableMetadata::Parse(const string &metadat
 	// Store the snapshot
 	result->snapshots[snapshot.snapshot_id] = snapshot;
 
-	// Derive the table location from the metadata path
-	// metadata_path is like: /path/to/table/snapshot/snapshot-1
-	// table_location is: /path/to/table
+	// Derive the table location from the metadata path. Snapshots live under <table>/snapshot/, but
+	// the same snapshot JSON is also read from <table>/tag/tag-<name> (tags) — strip whichever applies.
+	// (For a branch the path is <table>/branch/branch-<name>/snapshot/, which correctly resolves to
+	// the branch root, where that branch's manifests live.)
 	string table_location;
 	auto snapshot_dir_pos = metadata_path.rfind("/snapshot/");
+	auto tag_dir_pos = metadata_path.rfind("/tag/");
 	if (snapshot_dir_pos != string::npos) {
 		table_location = metadata_path.substr(0, snapshot_dir_pos);
+	} else if (tag_dir_pos != string::npos) {
+		table_location = metadata_path.substr(0, tag_dir_pos);
 	} else {
 		throw IOException("Cannot determine table location from metadata path: " + metadata_path);
 	}

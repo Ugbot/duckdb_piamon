@@ -179,6 +179,21 @@ def gen_evolve(catalog, db):
     return ("evolve", 5)
 
 
+def gen_tagged(catalog, db):
+    """Append table with a tag created at the first snapshot, for tag time-travel tests."""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("v", pa.int64())]),
+        options={"bucket": "-1"},
+    )
+    catalog.create_table(f"{db}.tagged", schema, False)
+    table = catalog.get_table(f"{db}.tagged")
+    write(table, pa.record_batch({"id": pa.array([1, 2], pa.int64()), "v": pa.array([10, 20], pa.int64())}))
+    table.create_tag("v1")  # tag at snapshot 1 (2 rows)
+    table = catalog.get_table(f"{db}.tagged")
+    write(table, pa.record_batch({"id": pa.array([3], pa.int64()), "v": pa.array([30], pa.int64())}))
+    return ("tagged", 3)
+
+
 def main():
     warehouse = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath("data/generated/paimon")
     if os.path.exists(warehouse):
@@ -193,7 +208,7 @@ def main():
         pass
 
     results = []
-    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve):
+    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")
