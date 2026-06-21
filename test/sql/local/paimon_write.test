@@ -1,0 +1,54 @@
+# name: test/sql/local/paimon_write.test
+# group: [local]
+#
+# Write path: CREATE TABLE + INSERT through the Paimon catalog, then read back. The written tables
+# are also verified to be readable by pypaimon (the reference implementation) in the cross-engine
+# checks under scripts/ — here we assert the in-engine round trip.
+
+require avro
+
+require parquet
+
+statement ok
+LOAD '__WORKING_DIRECTORY__/build/release/extension/iceberg/paimon.duckdb_extension';
+
+statement ok
+ATTACH '__TEST_DIR__' AS pm (TYPE paimon);
+
+statement ok
+CREATE TABLE pm.paimon_write_t (id BIGINT, name VARCHAR, score DOUBLE);
+
+statement ok
+INSERT INTO pm.paimon_write_t SELECT i, 'name_' || i, i * 1.5 FROM range(10) t(i);
+
+# Read back the first commit.
+query III
+SELECT count(*), sum(id), round(sum(score), 1) FROM pm.paimon_write_t;
+----
+10	45	67.5
+
+query T
+SELECT name FROM pm.paimon_write_t ORDER BY id LIMIT 3;
+----
+name_0
+name_1
+name_2
+
+# A second INSERT must append (carry prior manifests forward), not replace.
+statement ok
+INSERT INTO pm.paimon_write_t SELECT i, 'name_' || i, i * 1.5 FROM range(10, 15) t(i);
+
+query II
+SELECT count(*), sum(id) FROM pm.paimon_write_t;
+----
+15	105
+
+# Two APPEND snapshots exist after two commits.
+query IT
+SELECT snapshot_id, commit_kind FROM paimon_snapshots('__TEST_DIR__/paimon_write_t') ORDER BY snapshot_id;
+----
+1	APPEND
+2	APPEND
+
+statement ok
+DETACH pm;

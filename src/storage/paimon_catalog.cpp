@@ -73,7 +73,9 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	}
 
 	auto &table_entry = op.table;
-	string table_path = table_entry.name;
+	// Use the absolute table directory (warehouse/<table>), not the bare table name.
+	auto &paimon_table = table_entry.Cast<PaimonTableEntry>();
+	string table_path = paimon_table.GetTablePath();
 
 	// Get the column names and types
 	auto names = table_entry.GetColumns().GetColumnNames();

@@ -83,29 +83,13 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 		schema.fields.push_back(field);
 	}
 
-	// Write metadata.json with initial schema
-	string metadata_json = "{\n";
-	metadata_json += "  \"metaVersion\": \"2\",\n";
-	metadata_json += "  \"version\": 2,\n";
-	metadata_json += "  \"id\": 2,\n";
-	metadata_json += "  \"schemaId\": 0,\n";
-	metadata_json += "  \"snapshots\": [],\n";
-	metadata_json += "  \"currentSnapshotId\": null,\n";
-	metadata_json += "  \"lastSequenceNumber\": 0\n";
-	metadata_json += "}\n";
-
-	string metadata_path = table_path + "/metadata.json";
-	auto handle = fs.OpenFile(metadata_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
-	handle->Write((void *)metadata_json.c_str(), metadata_json.size());
-
-	// Create the initial snapshot for schema version 0
-	string schema_0_json = CreateSchemaJson(schema, 0);
-	string schema_path = table_path + "/schema/" + std::to_string(schema.id) + ".json";
+	// Write the initial Paimon schema file: {table}/schema/schema-0 (no extension, Paimon JSON).
 	string schema_dir = table_path + "/schema";
 	if (!fs.DirectoryExists(schema_dir)) {
 		fs.CreateDirectory(schema_dir);
 	}
-
+	string schema_0_json = CreateSchemaJson(schema, 0);
+	string schema_path = schema_dir + "/schema-" + std::to_string(schema.id);
 	auto schema_handle = fs.OpenFile(schema_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
 	schema_handle->Write((void *)schema_0_json.c_str(), schema_0_json.size());
 
@@ -172,26 +156,48 @@ static PaimonDataType DuckDBTypeToPaimonDataType(const LogicalType &type) {
 	return result;
 }
 
-// Helper to create schema JSON
+// Helper to create a Paimon schema file (JSON). Mirrors the format pypaimon/Flink write:
+// version, id, fields[{id,name,type}], highestFieldId, partitionKeys, primaryKeys, options.
 static string CreateSchemaJson(const PaimonSchema &schema, int schema_id) {
-	string json = "{\n";
-	json += "  \"id\": " + std::to_string(schema.id) + ",\n";
-	json += "  \"fields\": [\n";
+	auto json_array = [](const vector<string> &items) {
+		string out = "[";
+		for (idx_t i = 0; i < items.size(); i++) {
+			if (i > 0) {
+				out += ", ";
+			}
+			out += "\"" + items[i] + "\"";
+		}
+		return out + "]";
+	};
 
+	int highest_field_id = 0;
+	string json = "{\n";
+	json += "  \"version\": 3,\n";
+	json += "  \"id\": " + std::to_string(schema_id) + ",\n";
+	json += "  \"fields\": [\n";
 	for (idx_t i = 0; i < schema.fields.size(); i++) {
 		const auto &field = schema.fields[i];
-		if (i > 0) json += ",\n";
+		if (field.id > highest_field_id) {
+			highest_field_id = field.id;
+		}
+		string type_str = field.type.ToString();
+		if (!field.nullable) {
+			type_str += " NOT NULL";
+		}
+		if (i > 0) {
+			json += ",\n";
+		}
 		json += "    {\n";
 		json += "      \"id\": " + std::to_string(field.id) + ",\n";
 		json += "      \"name\": \"" + field.name + "\",\n";
-		json += "      \"type\": \"" + field.type.ToString() + "\",\n";
-		json += "      \"required\": " + string(field.nullable ? "false" : "true") + "\n";
+		json += "      \"type\": \"" + type_str + "\"\n";
 		json += "    }";
 	}
-
 	json += "\n  ],\n";
-	json += "  \"partitionKeys\": [],\n";
-	json += "  \"primaryKeys\": [],\n";
+	json += "  \"highestFieldId\": " + std::to_string(highest_field_id) + ",\n";
+	json += "  \"partitionKeys\": " + json_array(schema.partition_keys) + ",\n";
+	json += "  \"primaryKeys\": " + json_array(schema.primary_keys) + ",\n";
+	json += "  \"options\": {},\n";
 	json += "  \"comment\": \"\"\n";
 	json += "}\n";
 

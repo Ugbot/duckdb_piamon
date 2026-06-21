@@ -2,6 +2,8 @@
 #include "storage/paimon_catalog.hpp"
 #include "storage/paimon_table_entry.hpp"
 #include "paimon_metadata.hpp"
+#include "paimon_manifest.hpp"
+#include "iceberg_utils.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -13,6 +15,7 @@
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/connection.hpp"
 
 #include <fstream>
 #include <ctime>
@@ -100,8 +103,9 @@ SinkFinalizeType PaimonInsert::Finalize(Pipeline &pipeline, Event &event, Client
 		return SinkFinalizeType::READY;
 	}
 
-	// Get the table path from the table entry
-	string table_path = table->name;
+	// Get the absolute table directory from the Paimon table entry.
+	auto &paimon_table = table->Cast<PaimonTableEntry>();
+	string table_path = paimon_table.GetTablePath();
 
 	CommitWrittenFiles(context, table_path, global_state.written_files, global_state.insert_count);
 
@@ -116,6 +120,10 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
                                       const vector<PaimonWrittenFile> &written_files, idx_t total_rows) const {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 	FileStorePathFactory path_factory(table_path, 1);
+
+	// Avro writes (COPY ... TO ... (FORMAT AVRO)) must run on a SEPARATE connection: issuing them on
+	// the current context during Finalize re-enters the engine and deadlocks.
+	Connection conn(DatabaseInstance::GetDatabase(context));
 
 	// Ensure directories exist
 	string manifest_dir = table_path + "/manifest";
@@ -140,48 +148,54 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 				entries_sql += " UNION ALL ";
 			}
 
-			// Extract just the filename from the full path
+			// Paimon manifests store only the data file's basename. The full path is reconstructed
+			// by readers from the table location + partition dir + bucket-N + this name, so storing a
+			// "bucket-0/..."-prefixed path would double the bucket directory.
 			auto &wf = written_files[i];
 			string relative_path = wf.file_path;
-			// If the path starts with the table path, make it relative
-			if (StringUtil::StartsWith(relative_path, table_path)) {
-				relative_path = relative_path.substr(table_path.length());
-				if (StringUtil::StartsWith(relative_path, "/")) {
-					relative_path = relative_path.substr(1);
-				}
+			size_t last_slash = relative_path.find_last_of('/');
+			if (last_slash != string::npos) {
+				relative_path = relative_path.substr(last_slash + 1);
 			}
 
+			// Build a named STRUCT for _FILE so the Avro record carries the spec field names
+			// (_FILE_NAME, _FILE_SIZE, ...) that readers match on.
 			entries_sql += "SELECT ";
-			entries_sql += "CAST(0 AS TINYINT) AS _KIND, ";                           // ADD
+			entries_sql += "CAST(0 AS INTEGER) AS _KIND, ";                           // ADD
 			entries_sql += "CAST('' AS BLOB) AS _PARTITION, ";                        // Empty for non-partitioned
 			entries_sql += "CAST(" + std::to_string(wf.bucket) + " AS INTEGER) AS _BUCKET, ";
 			entries_sql += "CAST(1 AS INTEGER) AS _TOTAL_BUCKETS, ";
-			entries_sql += "ROW(";
-			entries_sql += "'" + relative_path + "', ";                                // _FILE_NAME
-			entries_sql += "CAST(" + std::to_string(wf.file_size) + " AS BIGINT), ";  // _FILE_SIZE
-			entries_sql += "CAST(" + std::to_string(wf.row_count) + " AS BIGINT), ";  // _ROW_COUNT
-			entries_sql += "CAST('' AS BLOB), ";                                       // _MIN_KEY
-			entries_sql += "CAST('' AS BLOB), ";                                       // _MAX_KEY
-			entries_sql += "CAST('' AS BLOB), ";                                       // _KEY_STATS
-			entries_sql += "CAST('' AS BLOB), ";                                       // _VALUE_STATS
-			entries_sql += "CAST(0 AS BIGINT), ";                                      // _MIN_SEQUENCE_NUMBER
-			entries_sql += "CAST(0 AS BIGINT), ";                                      // _MAX_SEQUENCE_NUMBER
-			entries_sql += "CAST(0 AS BIGINT), ";                                      // _SCHEMA_ID
-			entries_sql += "CAST(0 AS INTEGER), ";                                     // _LEVEL
-			entries_sql += "CAST([] AS VARCHAR[]), ";                                   // _EXTRA_FILES
-			entries_sql += "CAST(NULL AS TIMESTAMP), ";                                // _CREATION_TIME
-			entries_sql += "CAST(NULL AS BIGINT), ";                                   // _DELETE_ROW_COUNT
-			entries_sql += "CAST(NULL AS BLOB), ";                                     // _EMBEDDED_FILE_INDEX
-			entries_sql += "CAST(NULL AS TINYINT), ";                                  // _FILE_SOURCE
-			entries_sql += "CAST(NULL AS VARCHAR[]), ";                                // _VALUE_STATS_COLS
-			entries_sql += "CAST(NULL AS VARCHAR), ";                                  // _EXTERNAL_PATH
-			entries_sql += "CAST(NULL AS BIGINT), ";                                   // _FIRST_ROW_ID
-			entries_sql += "CAST(NULL AS VARCHAR[])";                                  // _WRITE_COLS
-			entries_sql += ") AS _FILE";
+			entries_sql += "{";
+			entries_sql += "'_FILE_NAME': '" + relative_path + "', ";
+			entries_sql += "'_FILE_SIZE': CAST(" + std::to_string(wf.file_size) + " AS BIGINT), ";
+			entries_sql += "'_ROW_COUNT': CAST(" + std::to_string(wf.row_count) + " AS BIGINT), ";
+			// Empty SimpleStats (min/max = empty BinaryRow = 12 zero bytes; no null counts). Readers
+			// require these to be records, not blobs.
+			string empty_stats = "{'_MIN_VALUES': "
+			                     "'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+			                     "'_MAX_VALUES': "
+			                     "'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+			                     "'_NULL_COUNTS': CAST([] AS BIGINT[])}";
+			entries_sql += "'_MIN_KEY': CAST('' AS BLOB), ";
+			entries_sql += "'_MAX_KEY': CAST('' AS BLOB), ";
+			entries_sql += "'_KEY_STATS': " + empty_stats + ", ";
+			entries_sql += "'_VALUE_STATS': " + empty_stats + ", ";
+			entries_sql += "'_MIN_SEQUENCE_NUMBER': CAST(0 AS BIGINT), ";
+			entries_sql += "'_MAX_SEQUENCE_NUMBER': CAST(0 AS BIGINT), ";
+			entries_sql += "'_SCHEMA_ID': CAST(0 AS BIGINT), ";
+			entries_sql += "'_LEVEL': CAST(0 AS INTEGER), ";
+			entries_sql += "'_EXTRA_FILES': CAST([] AS VARCHAR[]), ";
+			entries_sql += "'_CREATION_TIME': CAST(NULL AS BIGINT), ";
+			entries_sql += "'_DELETE_ROW_COUNT': CAST(NULL AS BIGINT), ";
+			entries_sql += "'_EMBEDDED_FILE_INDEX': CAST(NULL AS BLOB), ";
+			entries_sql += "'_FILE_SOURCE': CAST(NULL AS INTEGER), ";
+			entries_sql += "'_VALUE_STATS_COLS': CAST(NULL AS VARCHAR[]), ";
+			entries_sql += "'_EXTERNAL_PATH': CAST(NULL AS VARCHAR)";
+			entries_sql += "} AS _FILE";
 		}
 
 		string copy_sql = "COPY (" + entries_sql + ") TO '" + manifest_file_path + "' (FORMAT AVRO)";
-		auto result = context.Query(copy_sql, false);
+		auto result = conn.Query(copy_sql);
 		if (!result || result->HasError()) {
 			throw IOException("Failed to write Paimon manifest file: " +
 			                  (result ? result->GetError() : "unknown error"));
@@ -210,11 +224,16 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		list_sql += "CAST(" + std::to_string(manifest_file_size) + " AS BIGINT) AS _FILE_SIZE, ";
 		list_sql += "CAST(" + std::to_string(written_files.size()) + " AS BIGINT) AS _NUM_ADDED_FILES, ";
 		list_sql += "CAST(0 AS BIGINT) AS _NUM_DELETED_FILES, ";
-		list_sql += "CAST(NULL AS BLOB) AS _PARTITION_STATS, ";
+		// _PARTITION_STATS must be a non-null SimpleStats record. For an unpartitioned table the
+		// partition is an empty BinaryRow (12 zero bytes, matching Paimon's own output) and there are
+		// no per-partition null counts.
+		list_sql += "{'_MIN_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+		            "'_MAX_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+		            "'_NULL_COUNTS': CAST([] AS BIGINT[])} AS _PARTITION_STATS, ";
 		list_sql += "CAST(0 AS BIGINT) AS _SCHEMA_ID";
 
 		string copy_sql = "COPY (" + list_sql + ") TO '" + manifest_list_path + "' (FORMAT AVRO)";
-		auto result = context.Query(copy_sql, false);
+		auto result = conn.Query(copy_sql);
 		if (!result || result->HasError()) {
 			throw IOException("Failed to write Paimon manifest list file: " +
 			                  (result ? result->GetError() : "unknown error"));
@@ -228,7 +247,7 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		manifest_list_size = handle->GetFileSize();
 	}
 
-	// Step 3: Determine next snapshot ID
+	// Determine the next snapshot id from the LATEST hint (bare id, with legacy "snapshot-N" tolerated).
 	int64_t next_snapshot_id = 1;
 	string latest_file = table_path + "/snapshot/LATEST";
 	if (fs.FileExists(latest_file)) {
@@ -237,12 +256,87 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 			auto file_size = handle->GetFileSize();
 			string content(file_size, '\0');
 			handle->Read(&content[0], file_size);
-			// Content is like "snapshot-N"
+			StringUtil::Trim(content);
 			if (StringUtil::StartsWith(content, "snapshot-")) {
-				next_snapshot_id = std::stoll(content.substr(9)) + 1;
+				content = content.substr(9);
+			}
+			if (!content.empty()) {
+				next_snapshot_id = std::stoll(content) + 1;
 			}
 		} catch (...) {
 			// If we can't read LATEST, start at 1
+		}
+	}
+
+	const char *PARTITION_STATS_STRUCT =
+	    "{'_MIN_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+	    "'_MAX_VALUES': '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'::BLOB, "
+	    "'_NULL_COUNTS': CAST([] AS BIGINT[])}";
+
+	// Step 2b: Build the BASE manifest list = all manifests carried forward from the previous
+	// snapshot (its base + delta). Without this, each commit would only expose its own delta and
+	// previously-written data would vanish. For the first snapshot the base list is empty.
+	string base_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 1);
+	{
+		vector<PaimonManifestFileMeta> carried;
+		if (next_snapshot_id > 1) {
+			string prev_snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(next_snapshot_id - 1);
+			try {
+				string prev_json = IcebergUtils::FileToString(prev_snapshot_path, fs);
+				auto doc = unique_ptr<yyjson_doc, YyjsonDocDeleter>(
+				    yyjson_read(prev_json.c_str(), prev_json.size(), 0));
+				if (doc) {
+					auto root = yyjson_doc_get_root(doc.get());
+					for (const char *key : {"baseManifestList", "deltaManifestList"}) {
+						auto v = yyjson_obj_get(root, key);
+						if (v && yyjson_is_str(v)) {
+							string list_name = yyjson_get_str(v);
+							if (!list_name.empty()) {
+								auto metas = ReadPaimonManifestList(context, manifest_dir + "/" + list_name);
+								for (auto &m : metas) {
+									carried.push_back(m);
+								}
+							}
+						}
+					}
+				}
+			} catch (const std::exception &e) {
+				throw IOException("Failed to carry forward manifests from previous snapshot: " + string(e.what()));
+			}
+		}
+
+		string list_sql;
+		if (carried.empty()) {
+			list_sql = "SELECT CAST('' AS VARCHAR) AS _FILE_NAME, CAST(0 AS BIGINT) AS _FILE_SIZE, "
+			           "CAST(0 AS BIGINT) AS _NUM_ADDED_FILES, CAST(0 AS BIGINT) AS _NUM_DELETED_FILES, " +
+			           string(PARTITION_STATS_STRUCT) + " AS _PARTITION_STATS, CAST(0 AS BIGINT) AS _SCHEMA_ID "
+			           "WHERE 1=0";
+		} else {
+			for (idx_t i = 0; i < carried.size(); i++) {
+				auto &m = carried[i];
+				if (i > 0) {
+					list_sql += " UNION ALL ";
+				}
+				list_sql += "SELECT '" + m.file_name + "' AS _FILE_NAME, " +
+				            "CAST(" + std::to_string(m.file_size) + " AS BIGINT) AS _FILE_SIZE, " +
+				            "CAST(" + std::to_string(m.num_added_files) + " AS BIGINT) AS _NUM_ADDED_FILES, " +
+				            "CAST(" + std::to_string(m.num_deleted_files) + " AS BIGINT) AS _NUM_DELETED_FILES, " +
+				            string(PARTITION_STATS_STRUCT) + " AS _PARTITION_STATS, " +
+				            "CAST(" + std::to_string(m.schema_id) + " AS BIGINT) AS _SCHEMA_ID";
+			}
+		}
+		string copy_sql = "COPY (" + list_sql + ") TO '" + base_list_path + "' (FORMAT AVRO)";
+		auto result = conn.Query(copy_sql);
+		if (!result || result->HasError()) {
+			throw IOException("Failed to write Paimon base manifest list file: " +
+			                  (result ? result->GetError() : "unknown error"));
+		}
+	}
+	string base_list_filename = base_list_path;
+	{
+		size_t last_slash = base_list_filename.find_last_of('/');
+		if (last_slash != string::npos) {
+			base_list_filename = base_list_filename.substr(last_slash + 1);
 		}
 	}
 
@@ -263,7 +357,7 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	snapshot_json += "  \"version\": 3,\n";
 	snapshot_json += "  \"id\": " + std::to_string(next_snapshot_id) + ",\n";
 	snapshot_json += "  \"schemaId\": 0,\n";
-	snapshot_json += "  \"baseManifestList\": \"\",\n";
+	snapshot_json += "  \"baseManifestList\": \"" + base_list_filename + "\",\n";
 	snapshot_json += "  \"deltaManifestList\": \"" + manifest_list_filename + "\",\n";
 	snapshot_json += "  \"deltaManifestListSize\": " + std::to_string(manifest_list_size) + ",\n";
 	snapshot_json += "  \"changelogManifestList\": null,\n";
@@ -285,10 +379,10 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		handle->Write((void *)snapshot_json.c_str(), snapshot_json.size());
 	}
 
-	// Step 5: Update LATEST pointer
+	// Step 5: Update LATEST pointer. Paimon hint files hold the bare snapshot id ("1"), not the
+	// file name — this is what Flink/Spark/pypaimon expect.
 	{
-		string latest_content = "snapshot-" + std::to_string(next_snapshot_id);
-		// Remove old file first if it exists
+		string latest_content = std::to_string(next_snapshot_id);
 		if (fs.FileExists(latest_file)) {
 			fs.RemoveFile(latest_file);
 		}
@@ -296,10 +390,10 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		handle->Write((void *)latest_content.c_str(), latest_content.size());
 	}
 
-	// Create EARLIEST if it doesn't exist
+	// EARLIEST always points at the oldest retained snapshot; (re)write it to the bare id.
 	string earliest_file = table_path + "/snapshot/EARLIEST";
 	if (!fs.FileExists(earliest_file)) {
-		string earliest_content = "snapshot-" + std::to_string(next_snapshot_id);
+		string earliest_content = std::to_string(next_snapshot_id);
 		auto handle = fs.OpenFile(earliest_file, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 		handle->Write((void *)earliest_content.c_str(), earliest_content.size());
 	}

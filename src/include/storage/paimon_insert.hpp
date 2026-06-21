@@ -32,7 +32,10 @@ public:
 	                          OperatorSinkFinalizeInput &input) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
-	// Source interface
+	// Source interface (returns the inserted row count)
+	bool IsSource() const override {
+		return true;
+	}
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 
 	string GetName() const override;
