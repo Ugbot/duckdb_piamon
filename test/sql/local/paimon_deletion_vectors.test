@@ -57,3 +57,26 @@ SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark
 2	B2
 3	c
 5	e
+
+# Dynamic-bucket primary-key table (bucket=-1, hash index): reads via merge-on-read (the hash index
+# is write-side only). id=2 was updated to 'Y2'.
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_dynbucket') ORDER BY id;
+----
+1	x
+2	Y2
+3	z
+
+# Append table with a bloom-filter file-index: reads correctly, and a filter on the indexed column
+# returns the right rows (the file-index is a data-skipping optimization, not a correctness factor).
+query T
+SELECT name FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/appt_fileindex') ORDER BY id;
+----
+alice
+bob
+carol
+
+query T
+SELECT name FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/appt_fileindex') WHERE name = 'bob';
+----
+bob

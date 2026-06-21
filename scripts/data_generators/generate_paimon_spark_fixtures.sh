@@ -19,6 +19,15 @@ INSERT INTO paimon.default.pk_dv VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
 UPDATE paimon.default.pk_dv SET v='B2' WHERE id=2;
 DELETE FROM paimon.default.pk_dv WHERE id=4;
 INSERT INTO paimon.default.pk_dv VALUES (6,'f');
+
+CREATE TABLE paimon.default.pk_dynbucket (id INT, v STRING)
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='-1');
+INSERT INTO paimon.default.pk_dynbucket VALUES (1,'x'),(2,'y'),(3,'z');
+UPDATE paimon.default.pk_dynbucket SET v='Y2' WHERE id=2;
+
+CREATE TABLE paimon.default.appt_fileindex (id INT, name STRING)
+  TBLPROPERTIES ('bucket'='-1', 'file-index.bloom-filter.columns'='name');
+INSERT INTO paimon.default.appt_fileindex VALUES (1,'alice'),(2,'bob'),(3,'carol');
 EOSQL
 
 podman run --rm \
