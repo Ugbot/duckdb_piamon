@@ -77,29 +77,32 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	auto &paimon_table = table_entry.Cast<PaimonTableEntry>();
 	string table_path = paimon_table.GetTablePath();
 
-	// Primary-key tables require writing system columns (_KEY_*, _VALUE_KIND, _SEQUENCE_NUMBER) with
-	// globally-monotonic sequence numbers and bucket assignment — not yet implemented. Reject rather
-	// than write a table that can't be merged on read.
-	auto &metadata = paimon_table.GetMetadata();
-	if (metadata.schema && !metadata.schema->primary_keys.empty()) {
-		throw NotImplementedException(
-		    "INSERT into primary-key Paimon tables is not yet supported (append-only tables only)");
-	}
-
 	// Get the column names and types
 	auto names = table_entry.GetColumns().GetColumnNames();
 	auto types = table_entry.GetColumns().GetColumnTypes();
 
-	// Data goes to bucket-0/ directory (for non-partitioned tables)
+	auto &metadata = paimon_table.GetMetadata();
+	bool is_pk = metadata.schema && !metadata.schema->primary_keys.empty();
+
+	if (is_pk) {
+		// Primary-key tables: the insert operator buffers the raw rows and writes the data file with
+		// Paimon system columns (_KEY_*, _SEQUENCE_NUMBER, _VALUE_KIND) itself, then merge-on-read
+		// resolves the latest row per key. Feed the data plan directly (no upstream COPY).
+		auto &insert = planner.Make<PaimonInsert>(op, table_entry, op.column_index_map);
+		auto &pk_insert = insert.Cast<PaimonInsert>();
+		pk_insert.pk_mode = true;
+		pk_insert.pk_names = metadata.schema->primary_keys;
+		pk_insert.value_names = names;
+		pk_insert.value_types = types;
+		insert.children.push_back(*plan);
+		return insert;
+	}
+
+	// Append tables: stream value columns through a parquet COPY, then commit.
 	string data_path = table_path + "/bucket-0";
-
-	// Create the COPY TO FILE operator for parquet writing
 	auto &physical_copy = PaimonInsert::PlanCopyForInsert(context, planner, data_path, names, types, plan);
-
-	// Create the PaimonInsert operator downstream to collect results and commit
 	auto &insert = planner.Make<PaimonInsert>(op, table_entry, op.column_index_map);
 	insert.children.push_back(physical_copy);
-
 	return insert;
 }
 

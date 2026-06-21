@@ -16,6 +16,8 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/appender.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 
 #include <fstream>
 #include <ctime>
@@ -33,6 +35,8 @@ public:
 
 	vector<PaimonWrittenFile> written_files;
 	idx_t insert_count;
+	//! Buffered rows for primary-key writes (value columns only; system columns are added at commit).
+	unique_ptr<ColumnDataCollection> buffered;
 };
 
 //===--------------------------------------------------------------------===//
@@ -58,11 +62,22 @@ bool PaimonInsert::ParallelSink() const {
 }
 
 unique_ptr<GlobalSinkState> PaimonInsert::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<PaimonInsertGlobalState>();
+	auto state = make_uniq<PaimonInsertGlobalState>();
+	if (pk_mode) {
+		state->buffered = make_uniq<ColumnDataCollection>(context, value_types);
+	}
+	return std::move(state);
 }
 
 SinkResultType PaimonInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<PaimonInsertGlobalState>();
+
+	if (pk_mode) {
+		// Buffer the raw rows; the data file (with system columns) is written at Finalize.
+		global_state.buffered->Append(chunk);
+		global_state.insert_count += chunk.size();
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 
 	// The upstream PhysicalCopyToFile writes parquet files and sends us the results
 	// Each row has: file_path (VARCHAR), row_count (BIGINT), file_size (BIGINT), ...
@@ -99,17 +114,118 @@ SinkFinalizeType PaimonInsert::Finalize(Pipeline &pipeline, Event &event, Client
                                         OperatorSinkFinalizeInput &input) const {
 	auto &global_state = input.global_state.Cast<PaimonInsertGlobalState>();
 
-	if (global_state.written_files.empty()) {
-		return SinkFinalizeType::READY;
-	}
-
 	// Get the absolute table directory from the Paimon table entry.
 	auto &paimon_table = table->Cast<PaimonTableEntry>();
 	string table_path = paimon_table.GetTablePath();
 
-	CommitWrittenFiles(context, table_path, global_state.written_files, global_state.insert_count);
+	if (pk_mode) {
+		if (!global_state.buffered || global_state.buffered->Count() == 0) {
+			return SinkFinalizeType::READY;
+		}
+		CommitPrimaryKeyRows(context, table_path, *global_state.buffered);
+		return SinkFinalizeType::READY;
+	}
 
+	if (global_state.written_files.empty()) {
+		return SinkFinalizeType::READY;
+	}
+	CommitWrittenFiles(context, table_path, global_state.written_files, global_state.insert_count);
 	return SinkFinalizeType::READY;
+}
+
+//===--------------------------------------------------------------------===//
+// Primary-key write: materialize buffered rows with system columns, then commit.
+//===--------------------------------------------------------------------===//
+
+void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &table_path,
+                                        ColumnDataCollection &rows) const {
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	Connection conn(DatabaseInstance::GetDatabase(context));
+
+	string bucket_dir = table_path + "/bucket-0";
+	if (!fs.DirectoryExists(bucket_dir)) {
+		fs.CreateDirectory(bucket_dir);
+	}
+
+	auto quote_id = [](const string &n) {
+		string e;
+		for (char c : n) {
+			e += (c == '"') ? "\"\"" : string(1, c);
+		}
+		return "\"" + e + "\"";
+	};
+
+	// Determine the base sequence number: continue past the max sequence already in the table so
+	// later commits always outrank earlier ones for the same key (Paimon merge ordering).
+	int64_t base_seq = 0;
+	{
+		vector<string> existing;
+		fs.ListFiles(bucket_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::EndsWith(fname, ".parquet")) {
+				existing.push_back(bucket_dir + "/" + fname);
+			}
+		});
+		if (!existing.empty()) {
+			string list;
+			for (idx_t i = 0; i < existing.size(); i++) {
+				list += (i ? ", " : "") + ("'" + existing[i] + "'");
+			}
+			auto r = conn.Query("SELECT max(\"_SEQUENCE_NUMBER\") FROM read_parquet([" + list + "])");
+			if (r && !r->HasError()) {
+				auto v = r->Fetch();
+				if (v && v->size() > 0 && !v->GetValue(0, 0).IsNull()) {
+					base_seq = v->GetValue(0, 0).GetValue<int64_t>();
+				}
+			}
+		}
+	}
+
+	// Stage the buffered value rows in a temp table, then COPY them out with Paimon's PK system
+	// columns: _KEY_<pk> (one per key column), _SEQUENCE_NUMBER, _VALUE_KIND (0 = INSERT), values.
+	string staged_cols;
+	for (idx_t i = 0; i < value_names.size(); i++) {
+		staged_cols += (i ? ", " : "") + quote_id(value_names[i]) + " " + value_types[i].ToString();
+	}
+	if (auto r = conn.Query("CREATE TEMP TABLE __paimon_pk_stage (" + staged_cols + ")"); r && r->HasError()) {
+		throw IOException("Failed to stage Paimon PK rows: " + r->GetError());
+	}
+	{
+		Appender appender(conn, "__paimon_pk_stage");
+		for (auto &chunk : rows.Chunks()) {
+			appender.AppendDataChunk(const_cast<DataChunk &>(chunk));
+		}
+		appender.Close();
+	}
+
+	string uuid = UUID::ToString(UUID::GenerateRandomUUID());
+	string data_file = bucket_dir + "/data-" + uuid + "-0.parquet";
+
+	string projection;
+	for (auto &pk : pk_names) {
+		projection += quote_id(pk) + " AS " + quote_id("_KEY_" + pk) + ", ";
+	}
+	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
+	projection += "CAST(0 AS TINYINT) AS \"_VALUE_KIND\"";
+	for (auto &v : value_names) {
+		projection += ", " + quote_id(v);
+	}
+	string copy_sql = "COPY (SELECT " + projection + " FROM __paimon_pk_stage) TO '" + data_file + "' (FORMAT PARQUET)";
+	if (auto r = conn.Query(copy_sql); r && r->HasError()) {
+		conn.Query("DROP TABLE __paimon_pk_stage");
+		throw IOException("Failed to write Paimon PK data file: " + r->GetError());
+	}
+	conn.Query("DROP TABLE __paimon_pk_stage");
+
+	PaimonWrittenFile wf;
+	wf.file_path = data_file;
+	wf.row_count = (int64_t)rows.Count();
+	wf.bucket = 0;
+	if (fs.FileExists(data_file)) {
+		auto h = fs.OpenFile(data_file, FileFlags::FILE_FLAGS_READ);
+		wf.file_size = h->GetFileSize();
+	}
+	vector<PaimonWrittenFile> written {wf};
+	CommitWrittenFiles(context, table_path, written, rows.Count());
 }
 
 //===--------------------------------------------------------------------===//

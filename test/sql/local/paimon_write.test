@@ -50,6 +50,27 @@ SELECT snapshot_id, commit_kind FROM paimon_snapshots('__TEST_DIR__/paimon_write
 1	APPEND
 2	APPEND
 
+# --- Primary-key write: INSERT writes system columns; a later INSERT of an existing key upserts. ---
+statement ok
+CREATE TABLE pm.pk_w (id BIGINT PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO pm.pk_w SELECT i, 'a' || i FROM range(5) t(i);
+
+statement ok
+INSERT INTO pm.pk_w VALUES (2, 'updated'), (5, 'new');
+
+# Merge-on-read: id 2 upserted to 'updated', id 5 appended; 6 distinct keys.
+query IT
+SELECT id, v FROM pm.pk_w ORDER BY id;
+----
+0	a0
+1	a1
+2	updated
+3	a3
+4	a4
+5	new
+
 # DROP removes the table from the catalog and deletes its directory.
 statement ok
 DROP TABLE pm.paimon_write_t;
