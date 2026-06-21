@@ -105,6 +105,28 @@ SELECT id, v FROM pm.pk_w ORDER BY id;
 3	a3
 4	patched
 
+# --- Compaction: rewrite the active files into one; logical content is preserved. ---
+# pk_w currently has 5 keys spread across several data files (inserts/upsert/delete/update).
+query I
+SELECT files_compacted >= 2 FROM paimon_compact('__TEST_DIR__/pk_w');
+----
+true
+
+query IT
+SELECT id, v FROM pm.pk_w ORDER BY id;
+----
+0	reborn
+1	a1
+2	patched
+3	a3
+4	patched
+
+# After compaction the latest snapshot references a single data file.
+query I
+SELECT files_compacted FROM paimon_compact('__TEST_DIR__/pk_w');
+----
+0
+
 # DROP removes the table from the catalog and deletes its directory.
 statement ok
 DROP TABLE pm.paimon_write_t;

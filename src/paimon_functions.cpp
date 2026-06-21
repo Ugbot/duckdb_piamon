@@ -5,6 +5,8 @@
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "storage/paimon_insert.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -618,6 +620,126 @@ TableFunctionSet PaimonFunctions::GetPaimonAttachFunction() {
 }
 
 //===--------------------------------------------------------------------===//
+// paimon_compact: rewrite a table's active data files into a single file and commit a COMPACT
+// snapshot that references only the new file (reduces read amplification; merge-on-read still
+// resolves the logical content). Returns the number of files that were compacted.
+//===--------------------------------------------------------------------===//
+
+struct PaimonCompactBindData : public TableFunctionData {
+	string table_path;
+};
+
+struct PaimonCompactGlobalState : public GlobalTableFunctionState {
+	int64_t files_compacted = 0;
+	bool emitted = false;
+};
+
+static unique_ptr<FunctionData> PaimonCompactBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonCompactBindData>();
+	result->table_path = input.inputs[0].ToString();
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("files_compacted");
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonCompactInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonCompactBindData>();
+	auto state = make_uniq<PaimonCompactGlobalState>();
+	const string &table_path = bind_data.table_path;
+
+	// Discover the current active files + schema.
+	PaimonMultiFileList file_list(context, table_path);
+	PaimonOptions options;
+	vector<LogicalType> types;
+	vector<string> value_names;
+	file_list.Bind(types, value_names, options);
+	if (value_names.empty() || file_list.files.size() <= 1) {
+		// Nothing worth compacting (no schema, or already a single file).
+		state->files_compacted = 0;
+		return std::move(state);
+	}
+	bool is_pk =
+	    file_list.metadata && file_list.metadata->schema && !file_list.metadata->schema->primary_keys.empty();
+
+	Connection conn(DatabaseInstance::GetDatabase(context));
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	string bucket_dir = table_path + "/bucket-0";
+	if (!fs.DirectoryExists(bucket_dir)) {
+		fs.CreateDirectory(bucket_dir);
+	}
+
+	string proj;
+	for (idx_t i = 0; i < value_names.size(); i++) {
+		proj += (i ? ", " : "") + QuoteIdentifier(value_names[i]);
+	}
+	string select_merged;
+	if (is_pk) {
+		// Rewrite the merged (deduplicated) rows with fresh sequence numbers and INSERT kind.
+		string sys;
+		for (auto &pk : file_list.metadata->schema->primary_keys) {
+			sys += QuoteIdentifier(pk) + " AS " + QuoteIdentifier("_KEY_" + pk) + ", ";
+		}
+		sys += "CAST(row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", CAST(0 AS TINYINT) AS \"_VALUE_KIND\"";
+		select_merged = "SELECT " + sys + ", " + proj + " FROM paimon_scan(" + QuoteLiteral(table_path) + ")";
+	} else {
+		select_merged = "SELECT " + proj + " FROM paimon_scan(" + QuoteLiteral(table_path) + ")";
+	}
+
+	string uuid = UUID::ToString(UUID::GenerateRandomUUID());
+	string data_file = bucket_dir + "/data-" + uuid + "-0.parquet";
+	auto copy_res =
+	    conn.Query("COPY (" + select_merged + ") TO '" + data_file + "' (FORMAT PARQUET)");
+	if (copy_res->HasError()) {
+		throw IOException("Paimon compaction failed writing merged file: " + copy_res->GetError());
+	}
+
+	int64_t row_count = 0;
+	{
+		auto r = conn.Query("SELECT count(*) FROM read_parquet('" + data_file + "')");
+		if (r && !r->HasError()) {
+			auto v = r->Fetch();
+			if (v && v->size() > 0) {
+				row_count = v->GetValue(0, 0).GetValue<int64_t>();
+			}
+		}
+	}
+
+	PaimonWrittenFile wf;
+	wf.file_path = data_file;
+	wf.row_count = row_count;
+	wf.bucket = 0;
+	if (fs.FileExists(data_file)) {
+		auto h = fs.OpenFile(data_file, FileFlags::FILE_FLAGS_READ);
+		wf.file_size = h->GetFileSize();
+	}
+	state->files_compacted = (int64_t)file_list.files.size();
+	// Replace the active set with just the merged file (no carry-forward), as a COMPACT snapshot.
+	PaimonInsert::CommitWrittenFiles(context, table_path, {wf}, (idx_t)row_count, false, "COMPACT");
+	return std::move(state);
+}
+
+static void PaimonCompactExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<PaimonCompactGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(state.files_compacted));
+}
+
+static TableFunctionSet GetPaimonCompactFunction() {
+	TableFunctionSet set("paimon_compact");
+	TableFunction f({LogicalType::VARCHAR}, PaimonCompactExec, PaimonCompactBind, PaimonCompactInitGlobal);
+	f.name = "paimon_compact";
+	set.AddFunction(f);
+	return set;
+}
+
+//===--------------------------------------------------------------------===//
 // GetTableFunctions - Register all Paimon table functions
 //===--------------------------------------------------------------------===//
 
@@ -628,6 +750,7 @@ vector<TableFunctionSet> PaimonFunctions::GetTableFunctions(ExtensionLoader &loa
 	functions.push_back(GetPaimonScanFunction(loader));
 	functions.push_back(GetPaimonMetadataFunction());
 	functions.push_back(GetPaimonAttachFunction());
+	functions.push_back(GetPaimonCompactFunction());
 
 	return functions;
 }

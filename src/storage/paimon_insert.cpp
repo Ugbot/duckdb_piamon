@@ -233,7 +233,8 @@ void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &ta
 //===--------------------------------------------------------------------===//
 
 void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &table_path,
-                                      const vector<PaimonWrittenFile> &written_files, idx_t total_rows) {
+                                      const vector<PaimonWrittenFile> &written_files, idx_t total_rows,
+                                      bool carry_forward, const string &commit_kind) {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 	FileStorePathFactory path_factory(table_path, 1);
 
@@ -395,7 +396,7 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	string base_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 1);
 	{
 		vector<PaimonManifestFileMeta> carried;
-		if (next_snapshot_id > 1) {
+		if (next_snapshot_id > 1 && carry_forward) {
 			string prev_snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(next_snapshot_id - 1);
 			try {
 				string prev_json = IcebergUtils::FileToString(prev_snapshot_path, fs);
@@ -480,7 +481,7 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	snapshot_json += "  \"indexManifest\": null,\n";
 	snapshot_json += "  \"commitUser\": \"duckdb-paimon\",\n";
 	snapshot_json += "  \"commitIdentifier\": 9223372036854775807,\n";
-	snapshot_json += "  \"commitKind\": \"APPEND\",\n";
+	snapshot_json += "  \"commitKind\": \"" + commit_kind + "\",\n";
 	snapshot_json += "  \"timeMillis\": " + std::to_string(now_ms) + ",\n";
 	snapshot_json += "  \"logOffsets\": {},\n";
 	snapshot_json += "  \"totalRecordCount\": " + std::to_string(total_rows) + ",\n";

@@ -50,10 +50,13 @@ public:
 	                                           const vector<LogicalType> &types, optional_ptr<PhysicalOperator> plan);
 
 public:
-	//! Create manifest + manifest-list + snapshot after writing (carrying prior manifests forward).
-	//! Shared by INSERT and DELETE/UPDATE (which add data files / tombstones).
+	//! Create manifest + manifest-list + snapshot after writing.
+	//! Shared by INSERT and DELETE/UPDATE (which add data files / tombstones) and by compaction.
+	//! carry_forward=true accumulates prior manifests into the base list (normal append/upsert);
+	//! carry_forward=false replaces the active set with just `written_files` (compaction/overwrite).
 	static void CommitWrittenFiles(ClientContext &context, const string &table_path,
-	                               const vector<PaimonWrittenFile> &written_files, idx_t total_rows);
+	                               const vector<PaimonWrittenFile> &written_files, idx_t total_rows,
+	                               bool carry_forward = true, const string &commit_kind = "APPEND");
 
 private:
 
