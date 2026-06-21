@@ -7,6 +7,10 @@
 
 require parquet
 
+# Avro is needed only by the data-file-format test below (Avro-format data files); loading it into the
+# database makes read_avro available to the scan's internal connection.
+require avro
+
 require-env DUCKDB_PAIMON_HAVE_GENERATED_DATA
 
 # paimon is built as a separate loadable extension (not linked into the test binary), so load it
@@ -94,6 +98,23 @@ query I
 SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/append_partitioned') WHERE dt = '1999-01-01';
 ----
 0
+
+# --- Data file format dispatch: Avro-format data files are read via read_avro (not parquet). ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/fmt_avro');
+----
+10
+
+query II
+SELECT count(*) FILTER (WHERE v IS NOT NULL), count(DISTINCT id) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/fmt_avro');
+----
+10	10
+
+# --- ORC-format data files cannot be read (no ORC reader); the scan must raise a clear error. ---
+statement error
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/fmt_orc');
+----
+ORC data files
 
 # --- Catalog ATTACH + catalog-integrated scan ---
 statement ok

@@ -277,6 +277,40 @@ def gen_pk_first_row(catalog, db):
     return ("pk_firstrow", 3)
 
 
+def gen_avro_format(catalog, db):
+    """Append table whose DATA files are Avro (file.format=avro), exercising format-dispatched reading
+    via DuckDB's read_avro rather than Parquet. (file.compression=snappy sidesteps pypaimon's missing
+    zstandard codec library; the on-disk format is still a Paimon Avro data file.)"""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("v", pa.string())]),
+        options={"bucket": "-1", "file.format": "avro", "file.compression": "snappy"},
+    )
+    catalog.create_table(f"{db}.fmt_avro", schema, False)
+    table = catalog.get_table(f"{db}.fmt_avro")
+    n = 10
+    write(table, pa.record_batch({
+        "id": pa.array(list(range(n)), pa.int64()),
+        "v": pa.array([rand_str() for _ in range(n)], pa.string()),
+    }))
+    return ("fmt_avro", n)
+
+
+def gen_orc_format(catalog, db):
+    """Append table whose DATA files are ORC. DuckDB has no ORC reader, so the extension must raise a
+    clear, actionable error rather than misread the files — this fixture exists to assert that."""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("v", pa.string())]),
+        options={"bucket": "-1", "file.format": "orc"},
+    )
+    catalog.create_table(f"{db}.fmt_orc", schema, False)
+    table = catalog.get_table(f"{db}.fmt_orc")
+    write(table, pa.record_batch({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "v": pa.array(["a", "b", "c"], pa.string()),
+    }))
+    return ("fmt_orc", 3)
+
+
 def gen_tagged(catalog, db):
     """Append table with a tag created at the first snapshot, for tag time-travel tests."""
     schema = Schema.from_pyarrow_schema(
@@ -307,7 +341,8 @@ def main():
 
     results = []
     for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged, gen_rename,
-                gen_pk_partial_update, gen_pk_aggregation, gen_pk_first_row):
+                gen_pk_partial_update, gen_pk_aggregation, gen_pk_first_row,
+                gen_avro_format, gen_orc_format):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")

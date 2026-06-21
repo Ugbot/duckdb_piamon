@@ -22,6 +22,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
@@ -111,6 +112,51 @@ static string QuoteLiteral(const string &val) {
 		}
 	}
 	return "'" + escaped + "'";
+}
+
+// SQL list literal of file paths: ['a', 'b', ...].
+static string FileListLiteral(const vector<string> &files) {
+	string s = "[";
+	for (idx_t i = 0; i < files.size(); i++) {
+		s += (i ? ", " : "") + QuoteLiteral(files[i]);
+	}
+	return s + "]";
+}
+
+// Build the SQL table source over the data files, dispatching on file format (by extension). Parquet
+// is read with union_by_name so schema evolution (added/dropped/reordered columns) matches by name;
+// Avro via read_avro (its reader has no union_by_name, but Paimon avro data files within a table share
+// a schema). A table can mix formats across file.format changes, in which case the per-format reads
+// are combined with UNION ALL BY NAME. ORC data files cannot be read — this DuckDB distribution has
+// no ORC reader — so we fail with a clear, actionable error instead of misreading them.
+static string BuildDataFileSource(const vector<string> &files) {
+	vector<string> parquet, avro;
+	for (auto &f : files) {
+		auto dot = f.find_last_of('.');
+		string ext = (dot == string::npos) ? "" : StringUtil::Lower(f.substr(dot + 1));
+		if (ext == "avro") {
+			avro.push_back(f);
+		} else if (ext == "orc") {
+			throw NotImplementedException(
+			    "Paimon table uses ORC data files, which this DuckDB build cannot read (no ORC reader "
+			    "is available). Only Parquet and Avro data files are supported — rewrite the table with "
+			    "file.format=parquet, or read it via an engine with ORC support.");
+		} else {
+			// Parquet (Paimon's default) and any unknown/extensionless file fall through to read_parquet.
+			parquet.push_back(f);
+		}
+	}
+	string parquet_src =
+	    parquet.empty() ? "" : "read_parquet(" + FileListLiteral(parquet) + ", union_by_name := true)";
+	string avro_src = avro.empty() ? "" : "read_avro(" + FileListLiteral(avro) + ")";
+	if (avro.empty()) {
+		return parquet_src; // common path: parquet only
+	}
+	if (parquet.empty()) {
+		return avro_src;
+	}
+	// Mixed parquet + avro: union the two readers, aligning columns by name.
+	return "(SELECT * FROM " + parquet_src + " UNION ALL BY NAME SELECT * FROM " + avro_src + ")";
 }
 
 // ORDER BY clause for sequence ordering: the user-defined `sequence.field` columns (highest priority)
@@ -309,18 +355,11 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		return std::move(result);
 	}
 
-	// read_parquet([...], union_by_name := true) over the resolved active files. union_by_name
-	// handles schema evolution (added/dropped/reordered columns): files written under an older
-	// schema are matched by column name and missing columns surface as NULL. The outer projection
-	// then selects the latest schema's columns in order.
-	string file_array = "read_parquet([";
-	for (idx_t i = 0; i < file_list.files.size(); i++) {
-		if (i > 0) {
-			file_array += ", ";
-		}
-		file_array += QuoteLiteral(file_list.files[i]);
-	}
-	file_array += "], union_by_name := true)";
+	// Table source over the resolved active files, dispatched by file format (parquet/avro; ORC errors
+	// out). union_by_name (parquet) handles schema evolution — files written under an older schema are
+	// matched by column name and missing columns surface as NULL — and the outer projection then
+	// selects the latest schema's columns in order.
+	string file_array = BuildDataFileSource(file_list.files);
 
 	if (!is_pk) {
 		result->sql = "SELECT " + projection + " FROM " + file_array;
@@ -563,6 +602,14 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
 	state->column_ids = input.column_ids;
 	if (bind_data.sql.empty()) {
 		return std::move(state); // no files → no rows
+	}
+	// Avro data files are read via read_avro (the avro extension). Paimon does not force-load avro at
+	// startup (the common parquet path needs no avro), so load it lazily only when avro files are
+	// actually present. TryAutoLoadExtension makes this transparent where autoloading is enabled and
+	// is a no-op when avro is already loaded; otherwise read_avro's own error (INSTALL avro; LOAD
+	// avro;) surfaces from the query below.
+	if (bind_data.sql.find("read_avro(") != string::npos) {
+		ExtensionHelper::TryAutoLoadExtension(context, "avro");
 	}
 	// Execute on a fresh connection so we don't re-enter the binding context. If a predicate was
 	// pushed down, wrap the query so the parquet reader prunes row groups (a pure optimization; the
