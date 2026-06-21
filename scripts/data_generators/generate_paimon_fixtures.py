@@ -152,6 +152,33 @@ def gen_pk_multi(catalog, db):
     return ("pk_multi", len(keys))
 
 
+def gen_evolve(catalog, db):
+    """Append table whose schema evolves (add a column) between commits, so data files exist under
+    multiple schema ids. Readers must surface the added column as NULL for older files."""
+    from pypaimon.schema.schema_change import SchemaChange
+    from pypaimon.schema.data_types import DataTypeParser
+
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("a", pa.int64())]),
+        options={"bucket": "-1"},
+    )
+    catalog.create_table(f"{db}.evolve", schema, False)
+    table = catalog.get_table(f"{db}.evolve")
+    write(table, pa.record_batch({
+        "id": pa.array([0, 1, 2], pa.int64()),
+        "a": pa.array([10, 11, 12], pa.int64()),
+    }))
+    # Add column b, then write rows that populate it.
+    catalog.alter_table(f"{db}.evolve", [SchemaChange.add_column("b", DataTypeParser.parse_data_type("STRING"))], False)
+    table = catalog.get_table(f"{db}.evolve")
+    write(table, pa.record_batch({
+        "id": pa.array([3, 4], pa.int64()),
+        "a": pa.array([13, 14], pa.int64()),
+        "b": pa.array(["x", "y"], pa.string()),
+    }))
+    return ("evolve", 5)
+
+
 def main():
     warehouse = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath("data/generated/paimon")
     if os.path.exists(warehouse):
@@ -166,7 +193,7 @@ def main():
         pass
 
     results = []
-    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi):
+    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")

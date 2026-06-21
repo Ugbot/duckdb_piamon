@@ -48,6 +48,16 @@ SELECT primary_keys FROM paimon_metadata('__WORKING_DIRECTORY__/data/generated/p
 ----
 id
 
+# --- Schema evolution: a column added between commits surfaces as NULL for older data files ---
+query III
+SELECT id, a, b FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/evolve') ORDER BY id;
+----
+0	10	NULL
+1	11	NULL
+2	12	NULL
+3	13	x
+4	14	y
+
 # --- Catalog ATTACH + catalog-integrated scan ---
 statement ok
 ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);

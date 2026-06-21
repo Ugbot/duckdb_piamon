@@ -149,7 +149,10 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		return std::move(result);
 	}
 
-	// read_parquet([...]) over the resolved active files.
+	// read_parquet([...], union_by_name := true) over the resolved active files. union_by_name
+	// handles schema evolution (added/dropped/reordered columns): files written under an older
+	// schema are matched by column name and missing columns surface as NULL. The outer projection
+	// then selects the latest schema's columns in order.
 	string file_array = "read_parquet([";
 	for (idx_t i = 0; i < file_list.files.size(); i++) {
 		if (i > 0) {
@@ -157,7 +160,7 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		}
 		file_array += QuoteLiteral(file_list.files[i]);
 	}
-	file_array += "])";
+	file_array += "], union_by_name := true)";
 
 	if (!is_pk) {
 		result->sql = "SELECT " + projection + " FROM " + file_array;
