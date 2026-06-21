@@ -1,5 +1,6 @@
 #include "paimon_manifest.hpp"
 #include "paimon_avro_scan.hpp"
+#include "paimon_binary_row.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -102,6 +103,7 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 	idx_t kind_idx = FindColumn(names, "_KIND");
 	idx_t bucket_idx = FindColumn(names, "_BUCKET");
 	idx_t total_buckets_idx = FindColumn(names, "_TOTAL_BUCKETS");
+	idx_t partition_idx = FindColumn(names, "_PARTITION");
 	idx_t file_idx = FindColumn(names, "_FILE");
 
 	if (kind_idx == DConstants::INVALID_INDEX || file_idx == DConstants::INVALID_INDEX) {
@@ -139,6 +141,14 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 				auto val = chunk->GetValue(total_buckets_idx, row);
 				if (!val.IsNull()) {
 					entry.total_buckets = val.GetValue<int32_t>();
+				}
+			}
+
+			// _PARTITION: raw BinaryRow bytes (BLOB), decoded later against the partition keys.
+			if (partition_idx != DConstants::INVALID_INDEX) {
+				auto val = chunk->GetValue(partition_idx, row);
+				if (!val.IsNull()) {
+					entry.partition = StringValue::Get(val);
 				}
 			}
 
@@ -182,8 +192,25 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 //===--------------------------------------------------------------------===//
 
 vector<string> ComputeActiveDataFiles(ClientContext &context, const string &table_location,
-                                      const string &base_manifest_list, const string &delta_manifest_list) {
+                                      const string &base_manifest_list, const string &delta_manifest_list,
+                                      const PaimonSchema *schema) {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
+
+	// Resolve the partition-key field types (in partition-key order) so we can decode the
+	// _PARTITION BinaryRow into the Hive-style partition directory (key=value/...).
+	vector<string> partition_keys;
+	vector<PaimonDataType> partition_types;
+	if (schema) {
+		for (auto &pk : schema->partition_keys) {
+			for (auto &field : schema->fields) {
+				if (field.name == pk) {
+					partition_keys.push_back(field.name);
+					partition_types.push_back(field.type);
+					break;
+				}
+			}
+		}
+	}
 
 	// Collect all manifest file paths from both base and delta manifest lists
 	vector<string> manifest_file_paths;
@@ -269,6 +296,25 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		}
 	}
 
+	// Build the Hive-style partition directory ("dt=2024-01-01/", possibly multi-level) from the
+	// manifest's _PARTITION BinaryRow. Returns "" for unpartitioned tables / undecodable partitions.
+	auto partition_dir = [&](const string &partition_bytes) -> string {
+		if (partition_keys.empty() || partition_bytes.empty()) {
+			return "";
+		}
+		auto values = PaimonBinaryRow::DecodeSerialized(partition_bytes, partition_types);
+		if (values.size() != partition_keys.size()) {
+			return "";
+		}
+		string dir;
+		for (idx_t i = 0; i < partition_keys.size(); i++) {
+			// Paimon names a null partition value with partition.default-name (default below).
+			string v = values[i].IsNull() ? "__DEFAULT_PARTITION__" : values[i].ToString();
+			dir += partition_keys[i] + "=" + v + "/";
+		}
+		return dir;
+	};
+
 	// Convert active files to absolute paths
 	vector<string> result;
 	result.reserve(active_files.size());
@@ -278,8 +324,7 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		string file_path;
 
 		// The file_name in a manifest entry is relative to the bucket directory
-		// Full path: {table_location}/bucket-{N}/{file_name}
-		// Or for partitioned: {table_location}/{partition_path}/bucket-{N}/{file_name}
+		// Full path: {table_location}/[{partition_path}/]bucket-{N}/{file_name}
 		// The file_name field might already include the bucket prefix or be just the filename
 
 		if (StringUtil::StartsWith(entry.file.file_name, "/") ||
@@ -291,8 +336,9 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 			// Already has directory structure (e.g., "bucket-0/data-xxx.parquet" or "dt=.../bucket-0/...")
 			file_path = table_location + "/" + entry.file.file_name;
 		} else {
-			// Just a filename — put it under the bucket directory
-			file_path = table_location + "/bucket-" + std::to_string(entry.bucket) + "/" + entry.file.file_name;
+			// Just a filename — place it under [partition_dir/]bucket-{N}/.
+			file_path = table_location + "/" + partition_dir(entry.partition) + "bucket-" +
+			            std::to_string(entry.bucket) + "/" + entry.file.file_name;
 		}
 
 		result.push_back(file_path);

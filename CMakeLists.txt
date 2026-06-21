@@ -93,6 +93,7 @@ set(PAIMON_EXTENSION_SOURCES
     src/paimon_multi_file_list.cpp
     src/paimon_manifest.cpp
     src/paimon_avro_scan.cpp
+    src/paimon_binary_row.cpp
     # Shared utilities (IcebergUtils::FileToString, GetStorageLocation, etc.)
     src/common/utils.cpp
     # Paimon storage/catalog

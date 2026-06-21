@@ -4,10 +4,12 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "paimon_metadata.hpp"
 
 namespace duckdb {
 
 class ClientContext;
+struct PaimonSchema;
 
 //===--------------------------------------------------------------------===//
 // Paimon Manifest File Meta (rows in a manifest-list Avro file)
@@ -43,6 +45,9 @@ struct PaimonManifestEntryParsed {
 	int32_t bucket = 0;
 	int32_t total_buckets = 0;
 	PaimonDataFileInfo file;
+	//! Raw _PARTITION BinaryRow bytes (empty for unpartitioned tables). Decoded against the table's
+	//! partition keys to reconstruct the Hive-style partition directory (key=value/...).
+	string partition;
 };
 
 //===--------------------------------------------------------------------===//
@@ -56,9 +61,12 @@ vector<PaimonManifestFileMeta> ReadPaimonManifestList(ClientContext &context, co
 vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context, const string &manifest_file_path);
 
 //! Given a snapshot's manifest lists, compute the set of active data file paths.
-//! table_location is the root table path used to resolve relative file paths.
+//! table_location is the root table path used to resolve relative file paths. `schema` (may be null)
+//! supplies the partition keys/types needed to reconstruct partition directories from the manifest
+//! _PARTITION BinaryRow.
 //! Returns absolute paths to the active data files.
 vector<string> ComputeActiveDataFiles(ClientContext &context, const string &table_location,
-                                      const string &base_manifest_list, const string &delta_manifest_list);
+                                      const string &base_manifest_list, const string &delta_manifest_list,
+                                      const PaimonSchema *schema = nullptr);
 
 } // namespace duckdb

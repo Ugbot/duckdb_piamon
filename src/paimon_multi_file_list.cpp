@@ -41,7 +41,7 @@ void PaimonMultiFileList::DiscoverDataFiles() {
 		if (snapshot) {
 			try {
 				files = ComputeActiveDataFiles(context, path, snapshot->base_manifest_list,
-				                               snapshot->delta_manifest_list);
+				                               snapshot->delta_manifest_list, metadata->schema.get());
 				// Validate that every resolved file actually exists. For partitioned tables the
 				// partition directory (e.g. dt=.../) is encoded in the manifest's _PARTITION BinaryRow,
 				// which is not yet decoded — so resolved paths can be wrong. In that case fall back to
