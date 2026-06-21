@@ -1,0 +1,67 @@
+# name: test/sql/local/paimon_primary_key.test
+# group: [local]
+#
+# Primary-key tables: merge-on-read (deduplicate engine). Each key resolves to the row with the
+# highest sequence number across all data files; older versions are superseded. Expected values
+# are validated against pypaimon's own reader (the authoritative Paimon implementation).
+# Generate fixtures with: make paimon_data
+
+require avro
+
+require parquet
+
+require-env DUCKDB_PAIMON_HAVE_GENERATED_DATA
+
+statement ok
+LOAD '__WORKING_DIRECTORY__/build/release/extension/iceberg/paimon.duckdb_extension';
+
+# --- pk_dedup: 50 keys, 20 updated in a second commit. Latest version wins. ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup');
+----
+50
+
+# Each primary key appears exactly once after merge.
+query I
+SELECT max(c) FROM (SELECT id, count(*) c FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup') GROUP BY id);
+----
+1
+
+# Version distribution matches pypaimon ground truth (30 original, 20 updated).
+query II
+SELECT version, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup') GROUP BY version ORDER BY version;
+----
+1	30
+2	20
+
+# --- pk_multi: 40 keys across three commits. Latest commit per key wins. ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_multi');
+----
+40
+
+query II
+SELECT version, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_multi') GROUP BY version ORDER BY version;
+----
+1	16
+2	9
+3	15
+
+# Merge works through the catalog path too.
+statement ok
+ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);
+
+query I
+SELECT count(*) FROM pm.pk_dedup;
+----
+50
+
+query II
+SELECT version, count(*) FROM pm.pk_multi GROUP BY version ORDER BY version;
+----
+1	16
+2	9
+3	15
+
+statement ok
+DETACH pm;

@@ -123,8 +123,13 @@ def gen_pk(catalog, db):
     return ("pk_dedup", len(keys))
 
 
-def gen_pk_dv(catalog, db):
-    """Primary-key table with deletion-vectors enabled, with updates across commits."""
+def gen_pk_multi(catalog, db):
+    """Primary-key table with three commits to exercise multi-snapshot merge-on-read.
+
+    NOTE on deletion vectors: pypaimon batch writes do not run compaction, so a
+    `deletion-vectors.enabled` table cannot be produced in a readable state this way
+    (pypaimon itself reads it back as 0 rows). Deletion-vector raw read is therefore
+    validated separately against a compaction-bearing fixture (Flink/Spark)."""
     schema = Schema.from_pyarrow_schema(
         pa.schema([
             ("id", pa.int64()),
@@ -132,23 +137,19 @@ def gen_pk_dv(catalog, db):
             ("version", pa.int64()),
         ]),
         primary_keys=["id"],
-        options={"bucket": "1", "deletion-vectors.enabled": "true"},
+        options={"bucket": "1"},
     )
-    catalog.create_table(f"{db}.pk_dv", schema, False)
-    table = catalog.get_table(f"{db}.pk_dv")
-    keys = list(range(60))
-    write(table, pa.record_batch({
-        "id": pa.array(keys, pa.int64()),
-        "payload": pa.array([rand_str() for _ in keys], pa.string()),
-        "version": pa.array([1] * len(keys), pa.int64()),
-    }))
-    upd = random.sample(keys, 25)
-    write(table, pa.record_batch({
-        "id": pa.array(upd, pa.int64()),
-        "payload": pa.array([rand_str() for _ in upd], pa.string()),
-        "version": pa.array([2] * len(upd), pa.int64()),
-    }))
-    return ("pk_dv", len(keys))
+    catalog.create_table(f"{db}.pk_multi", schema, False)
+    table = catalog.get_table(f"{db}.pk_multi")
+    keys = list(range(40))
+    for v in (1, 2, 3):
+        subset = keys if v == 1 else sorted(random.sample(keys, 15))
+        write(table, pa.record_batch({
+            "id": pa.array(subset, pa.int64()),
+            "payload": pa.array([rand_str() for _ in subset], pa.string()),
+            "version": pa.array([v] * len(subset), pa.int64()),
+        }))
+    return ("pk_multi", len(keys))
 
 
 def main():
@@ -165,7 +166,7 @@ def main():
         pass
 
     results = []
-    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_dv):
+    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")

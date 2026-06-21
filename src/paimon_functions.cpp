@@ -1,6 +1,10 @@
 #include "paimon_functions.hpp"
 #include "paimon_metadata.hpp"
 #include "paimon_multi_file_reader.hpp"
+#include "paimon_multi_file_list.hpp"
+
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -37,37 +41,182 @@ static void AddPaimonNamedParameters(TableFunction &fun) {
 // Follows the Iceberg pattern: clone parquet_scan and inject PaimonMultiFileReader
 //===--------------------------------------------------------------------===//
 
-static void PaimonScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                                const TableFunction &function) {
-	throw NotImplementedException("PaimonScan serialization not implemented");
+//===--------------------------------------------------------------------===//
+// paimon_scan: reads the active data files of a Paimon table.
+//
+// Append-only tables are read directly. Primary-key tables are merged on read: the data files
+// carry _SEQUENCE_NUMBER and _VALUE_KIND, and for the default `deduplicate` merge engine the row
+// with the highest sequence number wins per key (delete tombstones drop the key). The merge is
+// expressed as a read_parquet(...) query over the discovered files and executed on a *separate*
+// connection at scan time — running it during bind re-enters the engine and deadlocks.
+//===--------------------------------------------------------------------===//
+
+// Paimon RowKind ordinals (org.apache.paimon.types.RowKind): INSERT=0, UPDATE_BEFORE=1,
+// UPDATE_AFTER=2, DELETE=3. A row "exists" if its kind is an add (+I / +U).
+static constexpr const char *VALUE_KIND_KEEP = "(0, 2)";
+
+struct PaimonScanBindData : public TableFunctionData {
+	string sql;            // the query to run (empty when there are no files)
+	vector<LogicalType> return_types;
+	vector<string> names;
+};
+
+struct PaimonScanGlobalState : public GlobalTableFunctionState {
+	unique_ptr<Connection> conn;
+	unique_ptr<QueryResult> result;
+	unique_ptr<DataChunk> current; // keeps the fetched chunk alive while output references it
+	vector<column_t> column_ids;   // projected columns (indices into the full schema)
+};
+
+static string QuoteIdentifier(const string &name) {
+	string escaped;
+	for (char c : name) {
+		if (c == '"') {
+			escaped += "\"\"";
+		} else {
+			escaped += c;
+		}
+	}
+	return "\"" + escaped + "\"";
+}
+
+static string QuoteLiteral(const string &val) {
+	string escaped;
+	for (char c : val) {
+		if (c == '\'') {
+			escaped += "''";
+		} else {
+			escaped += c;
+		}
+	}
+	return "'" + escaped + "'";
+}
+
+static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonScanBindData>();
+	string table_path = input.inputs[0].ToString();
+
+	// Discover the active data files + load the schema (manifest-driven, with directory fallback).
+	PaimonMultiFileList file_list(context, table_path);
+	PaimonOptions options;
+	file_list.Bind(result->return_types, result->names, options);
+
+	if (result->names.empty()) {
+		throw IOException("Could not determine schema for Paimon table at: " + table_path);
+	}
+
+	// Determine merge semantics from the table schema.
+	bool is_pk = file_list.metadata && file_list.metadata->schema &&
+	             !file_list.metadata->schema->primary_keys.empty();
+	vector<string> primary_keys;
+	if (is_pk) {
+		primary_keys = file_list.metadata->schema->primary_keys;
+	}
+
+	return_types = result->return_types;
+	names = result->names;
+
+	// Build the projection list (cast each column to its Paimon logical type so the query result
+	// types match the declared schema exactly).
+	string projection;
+	for (idx_t i = 0; i < result->names.size(); i++) {
+		if (i > 0) {
+			projection += ", ";
+		}
+		projection += "CAST(" + QuoteIdentifier(result->names[i]) + " AS " + result->return_types[i].ToString() +
+		              ") AS " + QuoteIdentifier(result->names[i]);
+	}
+
+	if (file_list.files.empty()) {
+		result->sql.clear(); // execute will return zero rows
+		return std::move(result);
+	}
+
+	// read_parquet([...]) over the resolved active files.
+	string file_array = "read_parquet([";
+	for (idx_t i = 0; i < file_list.files.size(); i++) {
+		if (i > 0) {
+			file_array += ", ";
+		}
+		file_array += QuoteLiteral(file_list.files[i]);
+	}
+	file_array += "])";
+
+	if (!is_pk) {
+		result->sql = "SELECT " + projection + " FROM " + file_array;
+	} else {
+		// Merge-on-read (deduplicate): keep the highest-sequence row per primary key, dropping
+		// tombstones. _SEQUENCE_NUMBER / _VALUE_KIND are physical columns in PK data files.
+		string pk_cols;
+		for (idx_t i = 0; i < primary_keys.size(); i++) {
+			if (i > 0) {
+				pk_cols += ", ";
+			}
+			pk_cols += QuoteIdentifier(primary_keys[i]);
+		}
+		string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols +
+		               " ORDER BY \"_SEQUENCE_NUMBER\" DESC) AS _paimon_rn FROM " + file_array;
+		result->sql = "SELECT " + projection + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND \"_VALUE_KIND\" IN " +
+		              string(VALUE_KIND_KEEP);
+	}
+
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &context,
+                                                                 TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonScanBindData>();
+	auto state = make_uniq<PaimonScanGlobalState>();
+	state->column_ids = input.column_ids;
+	if (bind_data.sql.empty()) {
+		return std::move(state); // no files → no rows
+	}
+	// Execute on a fresh connection so we don't re-enter the binding context.
+	state->conn = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
+	auto pending = state->conn->Query(bind_data.sql);
+	if (pending->HasError()) {
+		throw IOException("Paimon scan failed: " + pending->GetError());
+	}
+	state->result = std::move(pending);
+	return std::move(state);
+}
+
+static void PaimonScanExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<PaimonScanGlobalState>();
+	if (!state.result) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.current = state.result->Fetch();
+	if (!state.current || state.current->size() == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+	auto &chunk = *state.current;
+	// Apply projection pushdown: output the requested columns (column_ids index into the full
+	// schema). The fetched chunk is retained in the global state so these references stay valid.
+	for (idx_t i = 0; i < state.column_ids.size(); i++) {
+		auto col_id = state.column_ids[i];
+		if (col_id >= chunk.ColumnCount()) {
+			// Row-id / virtual column (e.g. requested by COUNT(*)): emit a row-number sequence.
+			// The actual values are not meaningful for Paimon, only the cardinality is.
+			output.data[i].Sequence(0, 1, chunk.size());
+		} else {
+			output.data[i].Reference(chunk.data[col_id]);
+		}
+	}
+	output.SetCardinality(chunk.size());
 }
 
 TableFunctionSet PaimonFunctions::GetPaimonScanFunction(ExtensionLoader &loader) {
-	// Clone the parquet_scan function and inject our MultiFileReader
-	auto &parquet_scan = loader.GetTableFunction("parquet_scan");
-	auto parquet_scan_copy = parquet_scan.functions;
-
-	for (auto &function : parquet_scan_copy.functions) {
-		// Inject PaimonMultiFileReader as the driver for reads
-		function.get_multi_file_reader = PaimonMultiFileReader::CreateInstance;
-		function.late_materialization = false;
-
-		// Disable broken/inefficient features for now
-		function.serialize = PaimonScanSerialize;
-		function.deserialize = nullptr;
-		function.statistics = nullptr;
-		function.table_scan_progress = nullptr;
-		function.get_bind_info = nullptr;
-
-		// Remove schema param (confusing in this context)
-		function.named_parameters.erase("schema");
-		AddPaimonNamedParameters(function);
-
-		function.name = "paimon_scan";
-	}
-
-	parquet_scan_copy.name = "paimon_scan";
-	return parquet_scan_copy;
+	TableFunctionSet set("paimon_scan");
+	TableFunction scan({LogicalType::VARCHAR}, PaimonScanExec, PaimonScanBind, PaimonScanInitGlobal);
+	scan.name = "paimon_scan";
+	scan.projection_pushdown = true;
+	AddPaimonNamedParameters(scan);
+	set.AddFunction(scan);
+	return set;
 }
 
 //===--------------------------------------------------------------------===//

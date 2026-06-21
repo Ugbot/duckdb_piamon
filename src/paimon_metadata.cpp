@@ -205,6 +205,16 @@ static PaimonDataType ParsePaimonTypeString(const string &type_str) {
 	StringUtil::Trim(trimmed);
 	string upper = StringUtil::Upper(trimmed);
 
+	// Paimon SQL type strings may carry a nullability suffix ("BIGINT NOT NULL", "STRING NOT NULL").
+	// Strip it so the type itself matches; nullability is tracked on the field separately.
+	if (StringUtil::EndsWith(upper, " NOT NULL")) {
+		upper = upper.substr(0, upper.size() - 9);
+		StringUtil::Trim(upper);
+	} else if (StringUtil::EndsWith(upper, " NULL")) {
+		upper = upper.substr(0, upper.size() - 5);
+		StringUtil::Trim(upper);
+	}
+
 	if (upper == "BOOLEAN") {
 		result.type_root = PaimonTypeRoot::BOOLEAN;
 	} else if (upper == "TINYINT" || upper == "SMALLINT" || upper == "INT" || upper == "INTEGER") {
@@ -404,8 +414,13 @@ static unique_ptr<PaimonSchema> LoadSchemaFile(const string &table_location, int
 
 			auto ftype = yyjson_obj_get(field_val, "type");
 			if (ftype && yyjson_is_str(ftype)) {
-				// Simple type string like "int", "string", "DECIMAL(10,2)"
-				field.type = ParsePaimonTypeString(yyjson_get_str(ftype));
+				// Simple type string like "int", "string", "DECIMAL(10,2)", "BIGINT NOT NULL"
+				string type_string = yyjson_get_str(ftype);
+				field.type = ParsePaimonTypeString(type_string);
+				// A " NOT NULL" suffix in the SQL type string means the column is required.
+				if (StringUtil::EndsWith(StringUtil::Upper(type_string), "NOT NULL")) {
+					field.nullable = false;
+				}
 			} else if (ftype && yyjson_is_obj(ftype)) {
 				// Complex type object — parse recursively
 				auto type_name = yyjson_obj_get(ftype, "type");
