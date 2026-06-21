@@ -141,6 +141,28 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
                                       const PaimonSchema *schema) {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 
+	// Branch support: a named branch (table_location ends in .../branch/branch-<name>) keeps its own
+	// snapshot + schema but SHARES the main table's manifest and data files, matching Paimon's
+	// branch-aware path resolution. Resolve each metadata/data path within the branch dir first, and
+	// fall back to the equivalent path under the main table root when it is not present there.
+	string main_root = table_location;
+	auto branch_pos = table_location.find("/branch/branch-");
+	if (branch_pos != string::npos) {
+		main_root = table_location.substr(0, branch_pos);
+	}
+	auto resolve = [&](const string &p) -> string {
+		if (main_root == table_location || fs.FileExists(p)) {
+			return p; // not a branch, or the branch already has its own copy
+		}
+		if (StringUtil::StartsWith(p, table_location)) {
+			string rebased = main_root + p.substr(table_location.size());
+			if (fs.FileExists(rebased)) {
+				return rebased;
+			}
+		}
+		return p;
+	};
+
 	// Resolve the partition-key field types (in partition-key order) so we can decode the
 	// _PARTITION BinaryRow into the Hive-style partition directory (key=value/...).
 	vector<string> partition_keys;
@@ -170,7 +192,7 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		if (StringUtil::StartsWith(manifest_list_ref, "/") || manifest_list_ref.find("://") != string::npos) {
 			manifest_list_path = manifest_list_ref;
 		} else {
-			manifest_list_path = table_location + "/manifest/" + manifest_list_ref;
+			manifest_list_path = resolve(table_location + "/manifest/" + manifest_list_ref);
 		}
 
 		if (!fs.FileExists(manifest_list_path)) {
@@ -184,7 +206,7 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 			if (StringUtil::StartsWith(meta.file_name, "/") || meta.file_name.find("://") != string::npos) {
 				manifest_path = meta.file_name;
 			} else {
-				manifest_path = table_location + "/manifest/" + meta.file_name;
+				manifest_path = resolve(table_location + "/manifest/" + meta.file_name);
 			}
 			manifest_file_paths.push_back(manifest_path);
 		}
@@ -279,11 +301,11 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		} else if (entry.file.file_name.find("bucket-") != string::npos ||
 		           entry.file.file_name.find("/") != string::npos) {
 			// Already has directory structure (e.g., "bucket-0/data-xxx.parquet" or "dt=.../bucket-0/...")
-			file_path = table_location + "/" + entry.file.file_name;
+			file_path = resolve(table_location + "/" + entry.file.file_name);
 		} else {
 			// Just a filename — place it under [partition_dir/]bucket-{N}/.
-			file_path = table_location + "/" + partition_dir(entry.partition) + "bucket-" +
-			            std::to_string(entry.bucket) + "/" + entry.file.file_name;
+			file_path = resolve(table_location + "/" + partition_dir(entry.partition) + "bucket-" +
+			                    std::to_string(entry.bucket) + "/" + entry.file.file_name);
 		}
 
 		result.push_back(file_path);

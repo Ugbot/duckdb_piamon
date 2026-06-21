@@ -1159,6 +1159,304 @@ static TableFunctionSet GetPaimonCompactFunction() {
 }
 
 //===--------------------------------------------------------------------===//
+// Tag & branch management
+//
+// Tags and branches are catalog-level references. A tag (tag/tag-<name>) is a verbatim copy of a
+// snapshot's JSON, pinning that snapshot against expiration. A branch (branch/branch-<name>/) is a
+// sub-tree with its own snapshot + schema that initially SHARES the main table's manifest and data
+// files (the reader falls back to the main root for those), matching Paimon's branch semantics.
+//===--------------------------------------------------------------------===//
+
+// Latest snapshot id from the LATEST hint (bare id, "snapshot-N" tolerated).
+static int64_t ReadLatestSnapshotId(FileSystem &fs, const string &table_path) {
+	string latest = table_path + "/snapshot/LATEST";
+	if (!fs.FileExists(latest)) {
+		throw IOException("Paimon table has no snapshots (missing " + latest + ")");
+	}
+	string content = IcebergUtils::FileToString(latest, fs);
+	StringUtil::Trim(content);
+	if (StringUtil::StartsWith(content, "snapshot-")) {
+		content = content.substr(9);
+	}
+	if (content.empty()) {
+		throw IOException("Paimon LATEST hint is empty for table " + table_path);
+	}
+	return std::stoll(content);
+}
+
+static void WriteNewFile(FileSystem &fs, const string &path, const string &content) {
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	if (!content.empty()) {
+		handle->Write((void *)content.c_str(), content.size());
+	}
+}
+
+// Pull an integer field out of a snapshot/tag JSON document.
+static int64_t JsonGetInt(const string &json, const char *key, int64_t fallback) {
+	auto doc = unique_ptr<yyjson_doc, YyjsonDocDeleter>(yyjson_read(json.c_str(), json.size(), 0));
+	if (!doc) {
+		return fallback;
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	auto v = yyjson_obj_get(root, key);
+	if (v && yyjson_is_int(v)) {
+		return yyjson_get_sint(v);
+	}
+	if (v && yyjson_is_uint(v)) {
+		return (int64_t)yyjson_get_uint(v);
+	}
+	return fallback;
+}
+
+struct PaimonRefBindData : public TableFunctionData {
+	string table_path;
+	string ref_name;    // tag or branch name
+	string source_ref;  // optional source tag (for create_branch)
+	int64_t snapshot_id = -1;
+	bool have_snapshot = false;
+};
+
+// Two-column (name, snapshot_id) status result shared by the create/delete commands.
+struct PaimonRefGlobalState : public GlobalTableFunctionState {
+	bool emitted = false;
+	string name;
+	int64_t snapshot_id = 0;
+};
+
+static unique_ptr<FunctionData> PaimonRefBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonRefBindData>();
+	result->table_path = input.inputs[0].ToString();
+	if (input.inputs.size() >= 2) {
+		result->ref_name = input.inputs[1].ToString();
+	}
+	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+		// 3rd arg: snapshot id (create_tag) or source tag name (create_branch). Dispatched per function.
+		if (input.inputs[2].type().id() == LogicalTypeId::VARCHAR) {
+			result->source_ref = input.inputs[2].ToString();
+		} else {
+			result->snapshot_id = input.inputs[2].GetValue<int64_t>();
+			result->have_snapshot = true;
+		}
+	}
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("name");
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("snapshot_id");
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonCreateTagInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonRefBindData>();
+	auto state = make_uniq<PaimonRefGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	const string &table_path = bind_data.table_path;
+	if (bind_data.ref_name.empty()) {
+		throw InvalidInputException("paimon_create_tag requires a non-empty tag name");
+	}
+	int64_t sid = bind_data.have_snapshot ? bind_data.snapshot_id : ReadLatestSnapshotId(fs, table_path);
+	string snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(sid);
+	if (!fs.FileExists(snapshot_path)) {
+		throw IOException("Snapshot " + std::to_string(sid) + " does not exist for table " + table_path);
+	}
+	string snapshot_json = IcebergUtils::FileToString(snapshot_path, fs);
+
+	string tag_dir = table_path + "/tag";
+	if (!fs.DirectoryExists(tag_dir)) {
+		fs.CreateDirectory(tag_dir);
+	}
+	string tag_path = tag_dir + "/tag-" + bind_data.ref_name;
+	if (fs.FileExists(tag_path)) {
+		throw InvalidInputException("Tag '" + bind_data.ref_name + "' already exists");
+	}
+	WriteNewFile(fs, tag_path, snapshot_json); // a tag is a verbatim copy of the snapshot JSON
+	state->name = bind_data.ref_name;
+	state->snapshot_id = sid;
+	return std::move(state);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonDeleteTagInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonRefBindData>();
+	auto state = make_uniq<PaimonRefGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	string tag_path = bind_data.table_path + "/tag/tag-" + bind_data.ref_name;
+	if (!fs.FileExists(tag_path)) {
+		throw InvalidInputException("Tag '" + bind_data.ref_name + "' does not exist");
+	}
+	state->snapshot_id = JsonGetInt(IcebergUtils::FileToString(tag_path, fs), "id", 0);
+	fs.RemoveFile(tag_path);
+	state->name = bind_data.ref_name;
+	return std::move(state);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonCreateBranchInit(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonRefBindData>();
+	auto state = make_uniq<PaimonRefGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	const string &table_path = bind_data.table_path;
+	if (bind_data.ref_name.empty()) {
+		throw InvalidInputException("paimon_create_branch requires a non-empty branch name");
+	}
+
+	// Source snapshot JSON: from a named tag if given, else the table's latest snapshot.
+	string snapshot_json;
+	int64_t sid;
+	if (!bind_data.source_ref.empty()) {
+		string tag_path = table_path + "/tag/tag-" + bind_data.source_ref;
+		if (!fs.FileExists(tag_path)) {
+			throw InvalidInputException("Source tag '" + bind_data.source_ref + "' does not exist");
+		}
+		snapshot_json = IcebergUtils::FileToString(tag_path, fs);
+		sid = JsonGetInt(snapshot_json, "id", 0);
+	} else {
+		sid = ReadLatestSnapshotId(fs, table_path);
+		string snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(sid);
+		if (!fs.FileExists(snapshot_path)) {
+			throw IOException("Snapshot " + std::to_string(sid) + " does not exist for table " + table_path);
+		}
+		snapshot_json = IcebergUtils::FileToString(snapshot_path, fs);
+	}
+	int64_t schema_id = JsonGetInt(snapshot_json, "schemaId", 0);
+
+	string branch_root = table_path + "/branch/branch-" + bind_data.ref_name;
+	if (fs.DirectoryExists(branch_root)) {
+		throw InvalidInputException("Branch '" + bind_data.ref_name + "' already exists");
+	}
+	// Lay out the branch sub-tree: its own snapshot + schema; manifests and data are shared from the
+	// main table root (the reader resolves them there).
+	fs.CreateDirectory(table_path + "/branch");
+	fs.CreateDirectory(branch_root);
+	fs.CreateDirectory(branch_root + "/snapshot");
+	fs.CreateDirectory(branch_root + "/schema");
+	WriteNewFile(fs, branch_root + "/snapshot/snapshot-" + std::to_string(sid), snapshot_json);
+	WriteNewFile(fs, branch_root + "/snapshot/LATEST", std::to_string(sid));
+	WriteNewFile(fs, branch_root + "/snapshot/EARLIEST", std::to_string(sid));
+	string schema_src = table_path + "/schema/schema-" + std::to_string(schema_id);
+	if (fs.FileExists(schema_src)) {
+		WriteNewFile(fs, branch_root + "/schema/schema-" + std::to_string(schema_id),
+		             IcebergUtils::FileToString(schema_src, fs));
+	}
+	state->name = bind_data.ref_name;
+	state->snapshot_id = sid;
+	return std::move(state);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonDeleteBranchInit(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonRefBindData>();
+	auto state = make_uniq<PaimonRefGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	string branch_root = bind_data.table_path + "/branch/branch-" + bind_data.ref_name;
+	if (!fs.DirectoryExists(branch_root)) {
+		throw InvalidInputException("Branch '" + bind_data.ref_name + "' does not exist");
+	}
+	fs.RemoveDirectory(branch_root);
+	state->name = bind_data.ref_name;
+	return std::move(state);
+}
+
+static void PaimonRefExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<PaimonRefGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value(state.name));
+	output.SetValue(1, 0, Value::BIGINT(state.snapshot_id));
+}
+
+// --- paimon_tags(table): list all tags as (name, snapshot_id) ---
+struct PaimonTagsListGlobalState : public GlobalTableFunctionState {
+	vector<std::pair<string, int64_t>> tags;
+	idx_t pos = 0;
+};
+
+static unique_ptr<FunctionData> PaimonTagsListBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonRefBindData>();
+	result->table_path = input.inputs[0].ToString();
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("tag_name");
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("snapshot_id");
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonTagsListInit(ClientContext &context,
+                                                               TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonRefBindData>();
+	auto state = make_uniq<PaimonTagsListGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	string tag_dir = bind_data.table_path + "/tag";
+	if (fs.DirectoryExists(tag_dir)) {
+		fs.ListFiles(tag_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::StartsWith(fname, "tag-")) {
+				string name = fname.substr(4);
+				int64_t sid = JsonGetInt(IcebergUtils::FileToString(tag_dir + "/" + fname, fs), "id", 0);
+				state->tags.emplace_back(name, sid);
+			}
+		});
+	}
+	std::sort(state->tags.begin(), state->tags.end());
+	return std::move(state);
+}
+
+static void PaimonTagsListExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<PaimonTagsListGlobalState>();
+	idx_t count = 0;
+	while (state.pos < state.tags.size() && count < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, count, Value(state.tags[state.pos].first));
+		output.SetValue(1, count, Value::BIGINT(state.tags[state.pos].second));
+		state.pos++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static TableFunctionSet GetPaimonCreateTagFunction() {
+	TableFunctionSet set("paimon_create_tag");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, PaimonRefExec, PaimonRefBind,
+	                              PaimonCreateTagInit));
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, PaimonRefExec,
+	                              PaimonRefBind, PaimonCreateTagInit));
+	return set;
+}
+
+static TableFunctionSet GetPaimonDeleteTagFunction() {
+	TableFunctionSet set("paimon_delete_tag");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, PaimonRefExec, PaimonRefBind,
+	                              PaimonDeleteTagInit));
+	return set;
+}
+
+static TableFunctionSet GetPaimonTagsFunction() {
+	TableFunctionSet set("paimon_tags");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR}, PaimonTagsListExec, PaimonTagsListBind, PaimonTagsListInit));
+	return set;
+}
+
+static TableFunctionSet GetPaimonCreateBranchFunction() {
+	TableFunctionSet set("paimon_create_branch");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, PaimonRefExec, PaimonRefBind,
+	                              PaimonCreateBranchInit));
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, PaimonRefExec,
+	                              PaimonRefBind, PaimonCreateBranchInit));
+	return set;
+}
+
+static TableFunctionSet GetPaimonDeleteBranchFunction() {
+	TableFunctionSet set("paimon_delete_branch");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, PaimonRefExec, PaimonRefBind,
+	                              PaimonDeleteBranchInit));
+	return set;
+}
+
+//===--------------------------------------------------------------------===//
 // GetTableFunctions - Register all Paimon table functions
 //===--------------------------------------------------------------------===//
 
@@ -1170,6 +1468,11 @@ vector<TableFunctionSet> PaimonFunctions::GetTableFunctions(ExtensionLoader &loa
 	functions.push_back(GetPaimonMetadataFunction());
 	functions.push_back(GetPaimonAttachFunction());
 	functions.push_back(GetPaimonCompactFunction());
+	functions.push_back(GetPaimonCreateTagFunction());
+	functions.push_back(GetPaimonDeleteTagFunction());
+	functions.push_back(GetPaimonTagsFunction());
+	functions.push_back(GetPaimonCreateBranchFunction());
+	functions.push_back(GetPaimonDeleteBranchFunction());
 
 	return functions;
 }
