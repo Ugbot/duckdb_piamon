@@ -267,3 +267,56 @@ does not exist
 
 statement ok
 DETACH rf;
+
+# --- Snapshot expiration -----------------------------------------------------------------------
+statement ok
+ATTACH '__TEST_DIR__' AS ex (TYPE paimon);
+
+statement ok
+CREATE TABLE ex.exp (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO ex.exp VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO ex.exp VALUES (3, 30);
+
+statement ok
+INSERT INTO ex.exp VALUES (4, 40);
+
+# Three snapshots so far.
+query I
+SELECT count(*) FROM paimon_snapshots('__TEST_DIR__/exp');
+----
+3
+
+# Tag the first snapshot, then expire down to the newest 1 snapshot.
+statement ok
+SELECT * FROM paimon_create_tag('__TEST_DIR__/exp', 'first', 1);
+
+query I
+SELECT expired_snapshots FROM paimon_expire_snapshots('__TEST_DIR__/exp', 1);
+----
+2
+
+# Only one snapshot remains.
+query I
+SELECT count(*) FROM paimon_snapshots('__TEST_DIR__/exp');
+----
+1
+
+# Live data is intact after expiration.
+query II
+SELECT count(*), sum(v) FROM paimon_scan('__TEST_DIR__/exp');
+----
+4	100
+
+# The tagged (now-expired) snapshot is still readable — its data files were pinned by the tag.
+query II
+SELECT id, v FROM paimon_scan('__TEST_DIR__/exp', version => 'first') ORDER BY id;
+----
+1	10
+2	20
+
+statement ok
+DETACH ex;

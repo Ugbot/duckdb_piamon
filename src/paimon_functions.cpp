@@ -1,5 +1,6 @@
 #include "paimon_functions.hpp"
 #include "paimon_metadata.hpp"
+#include "paimon_manifest.hpp"
 #include "paimon_multi_file_reader.hpp"
 #include "paimon_multi_file_list.hpp"
 
@@ -29,6 +30,7 @@
 #include "iceberg_utils.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <algorithm>
 
@@ -1457,6 +1459,195 @@ static TableFunctionSet GetPaimonDeleteBranchFunction() {
 }
 
 //===--------------------------------------------------------------------===//
+// paimon_expire_snapshots(table, retain_max): drop all but the newest `retain_max` snapshots, and
+// delete the manifest/data files that become unreferenced as a result. Snapshots referenced by a tag
+// are preserved (their data files are never deleted, even when the snapshot itself ages out), matching
+// Paimon's expiration semantics where tags pin data against expiration.
+//===--------------------------------------------------------------------===//
+
+struct PaimonExpireBindData : public TableFunctionData {
+	string table_path;
+	int64_t retain_max = 1;
+};
+
+struct PaimonExpireGlobalState : public GlobalTableFunctionState {
+	bool emitted = false;
+	int64_t expired_snapshots = 0;
+	int64_t deleted_files = 0;
+};
+
+static unique_ptr<FunctionData> PaimonExpireBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonExpireBindData>();
+	result->table_path = input.inputs[0].ToString();
+	if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
+		result->retain_max = input.inputs[1].GetValue<int64_t>();
+	}
+	if (result->retain_max < 1) {
+		throw InvalidInputException("paimon_expire_snapshots: retain_max must be >= 1");
+	}
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("expired_snapshots");
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("deleted_files");
+	return std::move(result);
+}
+
+// Collect every manifest-list, manifest-file and data-file path referenced by a snapshot/tag JSON.
+static void CollectReferencedFiles(ClientContext &context, const string &table_path, const string &snapshot_json,
+                                   const PaimonSchema *schema, std::unordered_set<string> &manifest_lists,
+                                   std::unordered_set<string> &manifests, std::unordered_set<string> &data) {
+	auto doc = unique_ptr<yyjson_doc, YyjsonDocDeleter>(yyjson_read(snapshot_json.c_str(), snapshot_json.size(), 0));
+	if (!doc) {
+		return;
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	string base, delta;
+	auto bv = yyjson_obj_get(root, "baseManifestList");
+	if (bv && yyjson_is_str(bv)) {
+		base = yyjson_get_str(bv);
+	}
+	auto dv = yyjson_obj_get(root, "deltaManifestList");
+	if (dv && yyjson_is_str(dv)) {
+		delta = yyjson_get_str(dv);
+	}
+	for (auto &list_ref : {base, delta}) {
+		if (list_ref.empty()) {
+			continue;
+		}
+		string list_path = table_path + "/manifest/" + list_ref;
+		manifest_lists.insert(list_path);
+		FileSystem &fs = FileSystem::GetFileSystem(context);
+		if (!fs.FileExists(list_path)) {
+			continue;
+		}
+		for (auto &meta : ReadPaimonManifestList(context, list_path)) {
+			manifests.insert(table_path + "/manifest/" + meta.file_name);
+		}
+	}
+	for (auto &f : ComputeActiveDataFiles(context, table_path, base, delta, schema)) {
+		data.insert(f);
+	}
+}
+
+static unique_ptr<GlobalTableFunctionState> PaimonExpireInit(ClientContext &context,
+                                                             TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PaimonExpireBindData>();
+	auto state = make_uniq<PaimonExpireGlobalState>();
+	FileSystem &fs = FileSystem::GetFileSystem(context);
+	const string &table_path = bind_data.table_path;
+
+	// Enumerate snapshot ids on disk.
+	vector<int64_t> snapshot_ids;
+	string snapshot_dir = table_path + "/snapshot";
+	if (fs.DirectoryExists(snapshot_dir)) {
+		fs.ListFiles(snapshot_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::StartsWith(fname, "snapshot-")) {
+				try {
+					snapshot_ids.push_back(std::stoll(fname.substr(9)));
+				} catch (...) {
+				}
+			}
+		});
+	}
+	std::sort(snapshot_ids.begin(), snapshot_ids.end());
+	if ((int64_t)snapshot_ids.size() <= bind_data.retain_max) {
+		return std::move(state); // nothing to expire
+	}
+
+	// Keep the newest retain_max snapshots; the rest expire.
+	int64_t earliest_retained = snapshot_ids[snapshot_ids.size() - bind_data.retain_max];
+
+	// Schema (latest) supplies partition keys/types for resolving partitioned data-file paths.
+	const PaimonSchema *schema = nullptr;
+	unique_ptr<PaimonTableMetadata> metadata;
+	try {
+		auto meta_path = PaimonTableMetadata::GetMetaDataPath(context, table_path, fs, PaimonOptions {});
+		metadata = PaimonTableMetadata::Parse(meta_path, fs, "gzip");
+		schema = metadata->schema.get();
+	} catch (...) {
+	}
+
+	// Files referenced by the snapshots/tags we keep ("live") vs. by every snapshot ("all"). The
+	// difference is exactly what expiration orphans and may delete.
+	std::unordered_set<string> live_lists, live_manifests, live_data;
+	std::unordered_set<string> all_lists, all_manifests, all_data;
+
+	for (int64_t id : snapshot_ids) {
+		string sp = snapshot_dir + "/snapshot-" + std::to_string(id);
+		if (!fs.FileExists(sp)) {
+			continue;
+		}
+		string json = IcebergUtils::FileToString(sp, fs);
+		CollectReferencedFiles(context, table_path, json, schema, all_lists, all_manifests, all_data);
+		if (id >= earliest_retained) {
+			CollectReferencedFiles(context, table_path, json, schema, live_lists, live_manifests, live_data);
+		}
+	}
+
+	// Tagged snapshots pin their data: treat every tag's referenced files as live.
+	string tag_dir = table_path + "/tag";
+	if (fs.DirectoryExists(tag_dir)) {
+		fs.ListFiles(tag_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::StartsWith(fname, "tag-")) {
+				string json = IcebergUtils::FileToString(tag_dir + "/" + fname, fs);
+				CollectReferencedFiles(context, table_path, json, schema, live_lists, live_manifests, live_data);
+			}
+		});
+	}
+
+	// Delete orphaned files (referenced only by expired snapshots), then the expired snapshot files.
+	auto delete_orphans = [&](const std::unordered_set<string> &all, const std::unordered_set<string> &live) {
+		for (auto &f : all) {
+			if (live.find(f) == live.end() && fs.FileExists(f)) {
+				fs.TryRemoveFile(f);
+				state->deleted_files++;
+			}
+		}
+	};
+	delete_orphans(all_data, live_data);
+	delete_orphans(all_manifests, live_manifests);
+	delete_orphans(all_lists, live_lists);
+
+	for (int64_t id : snapshot_ids) {
+		if (id < earliest_retained) {
+			string sp = snapshot_dir + "/snapshot-" + std::to_string(id);
+			if (fs.FileExists(sp)) {
+				fs.TryRemoveFile(sp);
+			}
+			state->expired_snapshots++;
+		}
+	}
+
+	// Advance the EARLIEST hint to the new earliest retained snapshot (overwrite if present).
+	string earliest_file = snapshot_dir + "/EARLIEST";
+	if (fs.FileExists(earliest_file)) {
+		fs.TryRemoveFile(earliest_file);
+	}
+	WriteNewFile(fs, earliest_file, std::to_string(earliest_retained));
+	return std::move(state);
+}
+
+static void PaimonExpireExec(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<PaimonExpireGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(state.expired_snapshots));
+	output.SetValue(1, 0, Value::BIGINT(state.deleted_files));
+}
+
+static TableFunctionSet GetPaimonExpireSnapshotsFunction() {
+	TableFunctionSet set("paimon_expire_snapshots");
+	set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, PaimonExpireExec, PaimonExpireBind,
+	                              PaimonExpireInit));
+	return set;
+}
+
+//===--------------------------------------------------------------------===//
 // GetTableFunctions - Register all Paimon table functions
 //===--------------------------------------------------------------------===//
 
@@ -1473,6 +1664,7 @@ vector<TableFunctionSet> PaimonFunctions::GetTableFunctions(ExtensionLoader &loa
 	functions.push_back(GetPaimonTagsFunction());
 	functions.push_back(GetPaimonCreateBranchFunction());
 	functions.push_back(GetPaimonDeleteBranchFunction());
+	functions.push_back(GetPaimonExpireSnapshotsFunction());
 
 	return functions;
 }
