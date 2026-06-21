@@ -116,6 +116,13 @@ struct PaimonOptions {
 	string table_version = "latest";
 	string version_name_format = "v%s%s";
 
+	//! Incremental (changelog) read: return the records written in the delta of snapshots
+	//! (incremental_from, incremental_to]. When enabled, no merge-on-read is applied — the raw
+	//! changelog records of that snapshot range are returned.
+	bool incremental = false;
+	uint64_t incremental_from = 0; // exclusive
+	uint64_t incremental_to = 0;   // inclusive
+
 	struct SnapshotLookup {
 		enum class SnapshotSource { LATEST, FROM_ID, FROM_TIMESTAMP };
 		SnapshotSource snapshot_source = SnapshotSource::LATEST;

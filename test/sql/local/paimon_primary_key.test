@@ -77,6 +77,18 @@ SELECT version, count(*) FROM pm.pk_multi GROUP BY version ORDER BY version;
 statement ok
 DETACH pm;
 
+# --- Incremental (changelog) read: the records written in the delta of snapshots (from, to]. ---
+# pk_dedup snapshot 1 = initial 50 rows; snapshot 2 = the 20 updated rows.
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup', incremental_to => 1);
+----
+50
+
+query II
+SELECT count(*), count(*) FILTER (WHERE version = 2) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup', incremental_from => 1, incremental_to => 2);
+----
+20	20
+
 # --- Tag time travel: read the table as of a named tag (tag/tag-v1 = snapshot 1). ---
 query I
 SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/tagged');

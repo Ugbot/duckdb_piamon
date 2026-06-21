@@ -36,6 +36,8 @@ static void AddPaimonNamedParameters(TableFunction &fun) {
 	fun.named_parameters["version"] = LogicalType::VARCHAR;
 	fun.named_parameters["snapshot_from_timestamp"] = LogicalType::TIMESTAMP;
 	fun.named_parameters["snapshot_from_id"] = LogicalType::UBIGINT;
+	fun.named_parameters["incremental_from"] = LogicalType::UBIGINT;
+	fun.named_parameters["incremental_to"] = LogicalType::UBIGINT;
 }
 
 //===--------------------------------------------------------------------===//
@@ -117,8 +119,14 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 			options.snapshot_lookup.snapshot_timestamp = kv.second.GetValue<timestamp_t>();
 		} else if (key == "metadata_compression_codec") {
 			options.metadata_compression_codec = StringValue::Get(kv.second);
+		} else if (key == "incremental_to") {
+			options.incremental = true;
+			options.incremental_to = kv.second.GetValue<uint64_t>();
+		} else if (key == "incremental_from") {
+			options.incremental_from = kv.second.GetValue<uint64_t>();
 		}
 	}
+	// incremental_to without incremental_from means "everything up to and including N" (from = 0).
 
 	// Discover the active data files + load the schema (manifest-driven, with directory fallback).
 	PaimonMultiFileList file_list(context, table_path, options);
@@ -128,8 +136,9 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		throw IOException("Could not determine schema for Paimon table at: " + table_path);
 	}
 
-	// Determine merge semantics from the table schema.
-	bool is_pk = file_list.metadata && file_list.metadata->schema &&
+	// Determine merge semantics from the table schema. An incremental (changelog) read returns the
+	// raw delta records of the snapshot range, so it is NOT merged even for primary-key tables.
+	bool is_pk = !options.incremental && file_list.metadata && file_list.metadata->schema &&
 	             !file_list.metadata->schema->primary_keys.empty();
 	vector<string> primary_keys;
 	if (is_pk) {

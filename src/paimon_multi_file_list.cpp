@@ -40,6 +40,38 @@ void PaimonMultiFileList::DiscoverDataFiles() {
 		// Metadata loading failed — still try to discover files directly
 	}
 
+	// Incremental (changelog) read: union the delta data files of snapshots (from, to].
+	if (scan_options.incremental && metadata) {
+		const PaimonSchema *schema = metadata->schema.get();
+		for (uint64_t s = scan_options.incremental_from + 1; s <= scan_options.incremental_to; s++) {
+			string snap_path = path + "/snapshot/snapshot-" + std::to_string(s);
+			if (!fs.FileExists(snap_path)) {
+				continue;
+			}
+			try {
+				string json = IcebergUtils::FileToString(snap_path, fs);
+				auto doc =
+				    unique_ptr<yyjson_doc, YyjsonDocDeleter>(yyjson_read(json.c_str(), json.size(), 0));
+				if (!doc) {
+					continue;
+				}
+				auto v = yyjson_obj_get(yyjson_doc_get_root(doc.get()), "deltaManifestList");
+				if (v && yyjson_is_str(v)) {
+					string delta_list = yyjson_get_str(v);
+					if (!delta_list.empty()) {
+						auto delta_files = ComputeActiveDataFiles(context, path, "", delta_list, schema);
+						for (auto &f : delta_files) {
+							files.push_back(f);
+						}
+					}
+				}
+			} catch (const std::exception &e) {
+				// Skip snapshots we can't read.
+			}
+		}
+		return;
+	}
+
 	// Step 2: Try manifest-based file discovery (correct approach)
 	if (metadata) {
 		auto *snapshot = metadata->GetCurrentSnapshot(scan_options);
