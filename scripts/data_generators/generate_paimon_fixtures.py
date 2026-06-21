@@ -198,6 +198,85 @@ def gen_rename(catalog, db):
     return ("renamed", 3)
 
 
+def gen_pk_partial_update(catalog, db):
+    """Primary-key table with merge-engine=partial-update. Later non-null values overwrite per column;
+    nulls do NOT overwrite. (pypaimon's own reader does not implement this merge, so the expected
+    values below are the Paimon/Spark spec result, computed by hand.)"""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("a", pa.int64()), ("b", pa.int64()), ("c", pa.string())]),
+        primary_keys=["id"],
+        options={"bucket": "1", "merge-engine": "partial-update"},
+    )
+    catalog.create_table(f"{db}.pk_partial", schema, False)
+    table = catalog.get_table(f"{db}.pk_partial")
+    # Commit 1: full rows for keys 1..3.
+    write(table, pa.record_batch({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "a": pa.array([10, 20, 30], pa.int64()),
+        "b": pa.array([None, 200, None], pa.int64()),
+        "c": pa.array(["x1", None, "x3"], pa.string()),
+    }))
+    # Commit 2: partial updates — only some columns set per key (nulls must not clobber).
+    write(table, pa.record_batch({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "a": pa.array([None, None, 99], pa.int64()),   # id1 keeps 10, id2 keeps 20, id3 -> 99
+        "b": pa.array([111, None, 333], pa.int64()),   # id1 -> 111, id2 keeps 200, id3 -> 333
+        "c": pa.array([None, "y2", None], pa.string()), # id1 keeps x1, id2 -> y2, id3 keeps x3
+    }))
+    # Expected (spec): 1 -> (10,111,x1), 2 -> (20,200,y2), 3 -> (99,333,x3)
+    return ("pk_partial", 3)
+
+
+def gen_pk_aggregation(catalog, db):
+    """Primary-key table with merge-engine=aggregation: each value column has its own agg function
+    applied across all records of a key (sum/max/min). pypaimon's reader returns the raw unmerged
+    rows, so the expected aggregated values below are the Paimon/Spark spec result."""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("total", pa.int64()), ("hi", pa.int64()), ("lo", pa.int64())]),
+        primary_keys=["id"],
+        options={
+            "bucket": "1",
+            "merge-engine": "aggregation",
+            "fields.total.aggregate-function": "sum",
+            "fields.hi.aggregate-function": "max",
+            "fields.lo.aggregate-function": "min",
+        },
+    )
+    catalog.create_table(f"{db}.pk_agg", schema, False)
+    table = catalog.get_table(f"{db}.pk_agg")
+    rows = [  # (id, total, hi, lo) across three commits
+        ([1, 2], [10, 5], [10, 5], [10, 5]),
+        ([1, 2], [3, 7], [99, 1], [1, 99]),
+        ([1], [2], [50], [50]),
+    ]
+    for ids, tot, hi, lo in rows:
+        write(table, pa.record_batch({
+            "id": pa.array(ids, pa.int64()),
+            "total": pa.array(tot, pa.int64()),
+            "hi": pa.array(hi, pa.int64()),
+            "lo": pa.array(lo, pa.int64()),
+        }))
+    # Expected: id1 total=15 hi=99 lo=1 ; id2 total=12 hi=5 lo=5
+    return ("pk_agg", 2)
+
+
+def gen_pk_first_row(catalog, db):
+    """Primary-key table with merge-engine=first-row: the FIRST record per key wins; later records for
+    the same key are ignored. pypaimon's reader returns last-write-wins, so the expected first-write
+    values below are the Paimon/Spark spec result."""
+    schema = Schema.from_pyarrow_schema(
+        pa.schema([("id", pa.int64()), ("v", pa.int64())]),
+        primary_keys=["id"],
+        options={"bucket": "1", "merge-engine": "first-row"},
+    )
+    catalog.create_table(f"{db}.pk_firstrow", schema, False)
+    table = catalog.get_table(f"{db}.pk_firstrow")
+    write(table, pa.record_batch({"id": pa.array([1, 2, 3], pa.int64()), "v": pa.array([100, 200, 300], pa.int64())}))
+    write(table, pa.record_batch({"id": pa.array([1, 2], pa.int64()), "v": pa.array([999, 888], pa.int64())}))
+    # Expected: id1=100, id2=200, id3=300 (first writes win)
+    return ("pk_firstrow", 3)
+
+
 def gen_tagged(catalog, db):
     """Append table with a tag created at the first snapshot, for tag time-travel tests."""
     schema = Schema.from_pyarrow_schema(
@@ -227,7 +306,8 @@ def main():
         pass
 
     results = []
-    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged, gen_rename):
+    for gen in (gen_append, gen_partitioned, gen_pk, gen_pk_multi, gen_evolve, gen_tagged, gen_rename,
+                gen_pk_partial_update, gen_pk_aggregation, gen_pk_first_row):
         try:
             results.append(gen(catalog, db))
             print(f"  [ok] {results[-1][0]}: {results[-1][1]} distinct keys/rows")

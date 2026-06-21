@@ -113,6 +113,68 @@ static string QuoteLiteral(const string &val) {
 	return "'" + escaped + "'";
 }
 
+// ORDER BY clause for sequence ordering: the user-defined `sequence.field` columns (highest priority)
+// followed by the physical `_pseq` (_SEQUENCE_NUMBER) tiebreaker, in the given direction.
+static string SeqOrderClause(const vector<string> &seq_fields, const char *dir) {
+	string s;
+	for (auto &f : seq_fields) {
+		s += QuoteIdentifier(f) + " " + dir + ", ";
+	}
+	s += "\"_pseq\" " + string(dir);
+	return s;
+}
+
+// A single orderable value used by arg_max/arg_min (partial-update / first_value / last_value): a
+// struct of the sequence.field columns + _pseq when a custom sequence is configured, else just _pseq.
+static string SeqOrderValue(const vector<string> &seq_fields) {
+	if (seq_fields.empty()) {
+		return "\"_pseq\"";
+	}
+	string s = "row(";
+	for (auto &f : seq_fields) {
+		s += QuoteIdentifier(f) + ", ";
+	}
+	s += "\"_pseq\")";
+	return s;
+}
+
+// SQL aggregate expression for the Paimon `aggregation` merge engine, mapping a Paimon
+// fields.<col>.aggregate-function to its DuckDB equivalent over the per-key group. Columns with no
+// configured function (or an unsupported one) fall back to last-non-null, matching Paimon's
+// last_non_null_value behaviour for a sensible default.
+static string AggExpr(const string &col, const string &fn, const string &order_val) {
+	string q = QuoteIdentifier(col);
+	if (fn == "sum") {
+		return "sum(" + q + ")";
+	}
+	if (fn == "min") {
+		return "min(" + q + ")";
+	}
+	if (fn == "max") {
+		return "max(" + q + ")";
+	}
+	if (fn == "count") {
+		return "count(" + q + ")";
+	}
+	if (fn == "product") {
+		return "product(" + q + ")";
+	}
+	if (fn == "bool_and") {
+		return "bool_and(" + q + ")";
+	}
+	if (fn == "bool_or") {
+		return "bool_or(" + q + ")";
+	}
+	if (fn == "first_value") {
+		return "arg_min(" + q + ", " + order_val + ")";
+	}
+	if (fn == "last_value") {
+		return "arg_max(" + q + ", " + order_val + ")";
+	}
+	// last_non_null_value and default: latest value, ignoring nulls.
+	return "arg_max(" + q + ", " + order_val + ") FILTER (WHERE " + q + " IS NOT NULL)";
+}
+
 static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<PaimonScanBindData>();
@@ -154,8 +216,22 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	bool is_pk = !options.incremental && file_list.metadata && file_list.metadata->schema &&
 	             !file_list.metadata->schema->primary_keys.empty();
 	vector<string> primary_keys;
+	string merge_engine = "deduplicate";
+	vector<string> seq_fields; // sequence.field columns (custom merge ordering), if configured
 	if (is_pk) {
 		primary_keys = file_list.metadata->schema->primary_keys;
+		auto &opts = file_list.metadata->schema->options;
+		auto me = opts.find("merge-engine");
+		if (me != opts.end()) {
+			merge_engine = StringUtil::Lower(me->second);
+		}
+		auto sf = opts.find("sequence.field");
+		if (sf != opts.end() && !sf->second.empty()) {
+			seq_fields = StringUtil::Split(sf->second, ',');
+			for (auto &f : seq_fields) {
+				StringUtil::Trim(f);
+			}
+		}
 	}
 
 	// Record the output indices of the primary-key columns so the row-id virtual column can carry the
@@ -249,19 +325,69 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	if (!is_pk) {
 		result->sql = "SELECT " + projection + " FROM " + file_array;
 	} else {
-		// Merge-on-read (deduplicate): keep the highest-sequence row per primary key, dropping
-		// tombstones. _SEQUENCE_NUMBER / _VALUE_KIND are physical columns in PK data files.
+		// Merge-on-read. Each PK data file carries _SEQUENCE_NUMBER and _VALUE_KIND. We first cast/
+		// rename columns to the latest schema (`projection`) and expose the sequence + kind as _pseq /
+		// _pvk, then apply the table's configured merge engine per primary key.
 		string pk_cols;
 		for (idx_t i = 0; i < primary_keys.size(); i++) {
-			if (i > 0) {
-				pk_cols += ", ";
-			}
-			pk_cols += QuoteIdentifier(primary_keys[i]);
+			pk_cols += (i ? ", " : "") + QuoteIdentifier(primary_keys[i]);
 		}
-		string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols +
-		               " ORDER BY \"_SEQUENCE_NUMBER\" DESC) AS _paimon_rn FROM " + file_array;
-		result->sql = "SELECT " + projection + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND \"_VALUE_KIND\" IN " +
-		              string(VALUE_KIND_KEEP);
+		string base = "SELECT " + projection + ", \"_SEQUENCE_NUMBER\" AS _pseq, \"_VALUE_KIND\" AS _pvk FROM " +
+		              file_array;
+		// `base` already casts/renames to the latest schema, so downstream selects reference the final
+		// column names directly (not the COALESCE projection, whose source columns no longer exist).
+		string name_list;
+		for (idx_t i = 0; i < result->names.size(); i++) {
+			name_list += (i ? ", " : "") + QuoteIdentifier(result->names[i]);
+		}
+
+		if (merge_engine == "first-row") {
+			// Keep the FIRST row per key (lowest sequence); later rows for the key are ignored.
+			string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols + " ORDER BY " +
+			               SeqOrderClause(seq_fields, "ASC") + ") AS _paimon_rn FROM (" + base + ")";
+			result->sql = "SELECT " + name_list + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND _pvk IN " +
+			              string(VALUE_KIND_KEEP);
+		} else if (merge_engine == "partial-update" || merge_engine == "aggregation") {
+			// Collapse each key to one row: partial-update takes the latest non-null value per column;
+			// aggregation applies each column's configured aggregate function. Delete records (_pvk=3)
+			// are excluded (retraction/sequence-group semantics are not modelled here).
+			bool is_agg = (merge_engine == "aggregation");
+			string order_val = SeqOrderValue(seq_fields);
+			auto &opts = file_list.metadata->schema->options;
+			case_insensitive_set_t pk_set(primary_keys.begin(), primary_keys.end());
+			string select_list;
+			for (idx_t i = 0; i < result->names.size(); i++) {
+				const string &col = result->names[i];
+				select_list += (i ? ", " : "");
+				if (pk_set.find(col) != pk_set.end()) {
+					select_list += QuoteIdentifier(col);
+					continue;
+				}
+				string expr;
+				if (is_agg) {
+					string fn;
+					auto fit = opts.find("fields." + col + ".aggregate-function");
+					if (fit != opts.end()) {
+						fn = StringUtil::Lower(fit->second);
+					}
+					expr = AggExpr(col, fn, order_val);
+				} else {
+					expr = "arg_max(" + QuoteIdentifier(col) + ", " + order_val + ") FILTER (WHERE " +
+					       QuoteIdentifier(col) + " IS NOT NULL)";
+				}
+				// Aggregates can widen the type (e.g. sum(BIGINT)->HUGEINT); cast back to the declared
+				// schema type so the result columns match the table's logical types exactly.
+				select_list += "CAST(" + expr + " AS " + result->return_types[i].ToString() + ") AS " +
+				               QuoteIdentifier(col);
+			}
+			result->sql = "SELECT " + select_list + " FROM (" + base + ") WHERE _pvk <> 3 GROUP BY " + pk_cols;
+		} else {
+			// deduplicate (default): keep the highest-sequence row per key, dropping tombstones.
+			string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols + " ORDER BY " +
+			               SeqOrderClause(seq_fields, "DESC") + ") AS _paimon_rn FROM (" + base + ")";
+			result->sql = "SELECT " + name_list + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND _pvk IN " +
+			              string(VALUE_KIND_KEEP);
+		}
 	}
 
 	return std::move(result);

@@ -100,3 +100,27 @@ SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/defau
 ----
 1	10
 2	20
+
+# --- Merge engine: partial-update. Later non-null values overwrite per column; nulls do not clobber.
+# pypaimon's own reader cannot do this merge — these are the Paimon/Spark spec results. ---
+query IIIT
+SELECT id, a, b, c FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_partial') ORDER BY id;
+----
+1	10	111	x1
+2	20	200	y2
+3	99	333	x3
+
+# --- Merge engine: aggregation. Per-column sum/max/min across all records of a key. ---
+query IIII
+SELECT id, total, hi, lo FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_agg') ORDER BY id;
+----
+1	15	99	1
+2	12	5	5
+
+# --- Merge engine: first-row. The first record per key wins; later records are ignored. ---
+query II
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_firstrow') ORDER BY id;
+----
+1	100
+2	200
+3	300
