@@ -8,6 +8,7 @@ namespace duckdb {
 struct PaimonMultiFileList : public MultiFileList {
 public:
 	PaimonMultiFileList(ClientContext &context, const string &path);
+	PaimonMultiFileList(ClientContext &context, const string &path, const PaimonOptions &options);
 	PaimonMultiFileList(ClientContext &context, const string &path, const vector<string> &files);
 
 public:
@@ -42,6 +43,7 @@ private:
 public:
 	ClientContext &context;
 	string path;
+	PaimonOptions scan_options; //! snapshot selection (latest / by id / by timestamp)
 	vector<string> files;
 	unique_ptr<PaimonTableMetadata> metadata;
 };

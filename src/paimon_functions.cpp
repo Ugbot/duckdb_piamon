@@ -97,9 +97,25 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	auto result = make_uniq<PaimonScanBindData>();
 	string table_path = input.inputs[0].ToString();
 
-	// Discover the active data files + load the schema (manifest-driven, with directory fallback).
-	PaimonMultiFileList file_list(context, table_path);
+	// Parse snapshot-selection named parameters for time travel.
 	PaimonOptions options;
+	for (auto &kv : input.named_parameters) {
+		auto key = StringUtil::Lower(kv.first);
+		if (key == "version") {
+			options.table_version = StringValue::Get(kv.second);
+		} else if (key == "snapshot_from_id") {
+			options.snapshot_lookup.snapshot_source = PaimonOptions::SnapshotLookup::SnapshotSource::FROM_ID;
+			options.snapshot_lookup.snapshot_id = kv.second.GetValue<uint64_t>();
+		} else if (key == "snapshot_from_timestamp") {
+			options.snapshot_lookup.snapshot_source = PaimonOptions::SnapshotLookup::SnapshotSource::FROM_TIMESTAMP;
+			options.snapshot_lookup.snapshot_timestamp = kv.second.GetValue<timestamp_t>();
+		} else if (key == "metadata_compression_codec") {
+			options.metadata_compression_codec = StringValue::Get(kv.second);
+		}
+	}
+
+	// Discover the active data files + load the schema (manifest-driven, with directory fallback).
+	PaimonMultiFileList file_list(context, table_path, options);
 	file_list.Bind(result->return_types, result->names, options);
 
 	if (result->names.empty()) {

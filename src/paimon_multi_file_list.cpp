@@ -14,6 +14,12 @@ PaimonMultiFileList::PaimonMultiFileList(ClientContext &context, const string &p
 	DiscoverDataFiles();
 }
 
+PaimonMultiFileList::PaimonMultiFileList(ClientContext &context, const string &path, const PaimonOptions &options)
+    : MultiFileList(vector<OpenFileInfo> {}, FileGlobOptions::ALLOW_EMPTY), context(context), path(path),
+      scan_options(options) {
+	DiscoverDataFiles();
+}
+
 PaimonMultiFileList::PaimonMultiFileList(ClientContext &context, const string &path, const vector<string> &files)
     : MultiFileList(vector<OpenFileInfo> {}, FileGlobOptions::ALLOW_EMPTY), context(context), path(path),
       files(files) {
@@ -26,18 +32,17 @@ PaimonMultiFileList::PaimonMultiFileList(ClientContext &context, const string &p
 void PaimonMultiFileList::DiscoverDataFiles() {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 
-	// Step 1: Load metadata (snapshot + schema)
+	// Step 1: Load metadata (snapshot + schema) for the requested snapshot (latest / id / timestamp).
 	try {
-		PaimonOptions options;
-		auto paimon_meta_path = PaimonTableMetadata::GetMetaDataPath(context, path, fs, options);
-		metadata = PaimonTableMetadata::Parse(paimon_meta_path, fs, options.metadata_compression_codec);
+		auto paimon_meta_path = PaimonTableMetadata::GetMetaDataPath(context, path, fs, scan_options);
+		metadata = PaimonTableMetadata::Parse(paimon_meta_path, fs, scan_options.metadata_compression_codec);
 	} catch (const std::exception &e) {
 		// Metadata loading failed — still try to discover files directly
 	}
 
 	// Step 2: Try manifest-based file discovery (correct approach)
 	if (metadata) {
-		auto *snapshot = metadata->GetCurrentSnapshot(PaimonOptions());
+		auto *snapshot = metadata->GetCurrentSnapshot(scan_options);
 		if (snapshot) {
 			try {
 				files = ComputeActiveDataFiles(context, path, snapshot->base_manifest_list,

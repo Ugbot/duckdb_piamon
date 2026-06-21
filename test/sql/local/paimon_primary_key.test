@@ -47,6 +47,19 @@ SELECT version, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/
 2	9
 3	15
 
+# --- Time travel: read the merged state as of a specific snapshot id. ---
+# Snapshot 1 is the initial load (all version 1); snapshot 2 is after the 20 updates.
+query II
+SELECT version, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup', snapshot_from_id => 1) GROUP BY version ORDER BY version;
+----
+1	50
+
+query II
+SELECT version, count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/pk_dedup', snapshot_from_id => 2) GROUP BY version ORDER BY version;
+----
+1	30
+2	20
+
 # Merge works through the catalog path too.
 statement ok
 ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);
