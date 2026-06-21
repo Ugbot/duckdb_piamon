@@ -127,6 +127,21 @@ SELECT files_compacted FROM paimon_compact('__TEST_DIR__/pk_w');
 ----
 0
 
+# --- CREATE TABLE AS: create + populate from a query in one statement. ---
+statement ok
+CREATE TABLE pm.ctas_t AS SELECT i AS id, 'v' || i AS v FROM range(5) t(i);
+
+query II
+SELECT count(*), sum(id) FROM pm.ctas_t;
+----
+5	10
+
+query IT
+SELECT id, v FROM pm.ctas_t ORDER BY id LIMIT 2;
+----
+0	v0
+1	v1
+
 # DROP removes the table from the catalog and deletes its directory.
 statement ok
 DROP TABLE pm.paimon_write_t;

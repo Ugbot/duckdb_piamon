@@ -61,9 +61,47 @@ void PaimonCatalog::ScanSchemas(ClientContext &context, std::function<void(Schem
 	callback(*default_schema);
 }
 
+// Build the physical insert operator for an (already-created) Paimon table. Shared by INSERT and
+// CREATE TABLE AS. Append tables stream value columns through a parquet COPY; primary-key tables
+// buffer the rows and write system columns themselves.
+static PhysicalOperator &BuildPaimonInsert(ClientContext &context, PhysicalPlanGenerator &planner,
+                                           PaimonTableEntry &paimon_table, LogicalOperator &op,
+                                           PhysicalOperator &plan,
+                                           physical_index_vector_t<idx_t> column_index_map) {
+	string table_path = paimon_table.GetTablePath();
+	auto names = paimon_table.GetColumns().GetColumnNames();
+	auto types = paimon_table.GetColumns().GetColumnTypes();
+	auto &metadata = paimon_table.GetMetadata();
+	bool is_pk = metadata.schema && !metadata.schema->primary_keys.empty();
+
+	if (is_pk) {
+		auto &insert = planner.Make<PaimonInsert>(op, paimon_table, std::move(column_index_map));
+		auto &pk_insert = insert.Cast<PaimonInsert>();
+		pk_insert.pk_mode = true;
+		pk_insert.pk_names = metadata.schema->primary_keys;
+		pk_insert.value_names = names;
+		pk_insert.value_types = types;
+		insert.children.push_back(plan);
+		return insert;
+	}
+
+	string data_path = table_path + "/bucket-0";
+	auto &physical_copy = PaimonInsert::PlanCopyForInsert(context, planner, data_path, names, types, &plan);
+	auto &insert = planner.Make<PaimonInsert>(op, paimon_table, std::move(column_index_map));
+	insert.children.push_back(physical_copy);
+	return insert;
+}
+
 PhysicalOperator &PaimonCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     LogicalCreateTable &op, PhysicalOperator &plan) {
-	throw NotImplementedException("CREATE TABLE AS not yet supported for Paimon tables");
+	// Create the table now (directory + schema-0), then insert the query results into it.
+	auto transaction = GetCatalogTransaction(context);
+	auto table_entry = op.schema.CreateTable(transaction, *op.info);
+	if (!table_entry) {
+		throw CatalogException("CREATE TABLE AS: table '%s' already exists", op.info->Base().table);
+	}
+	auto &paimon_table = table_entry->Cast<PaimonTableEntry>();
+	return BuildPaimonInsert(context, planner, paimon_table, op, plan, physical_index_vector_t<idx_t>());
 }
 
 PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -74,39 +112,8 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
 		throw BinderException("ON CONFLICT clause not yet supported for Paimon tables");
 	}
-
-	auto &table_entry = op.table;
-	// Use the absolute table directory (warehouse/<table>), not the bare table name.
-	auto &paimon_table = table_entry.Cast<PaimonTableEntry>();
-	string table_path = paimon_table.GetTablePath();
-
-	// Get the column names and types
-	auto names = table_entry.GetColumns().GetColumnNames();
-	auto types = table_entry.GetColumns().GetColumnTypes();
-
-	auto &metadata = paimon_table.GetMetadata();
-	bool is_pk = metadata.schema && !metadata.schema->primary_keys.empty();
-
-	if (is_pk) {
-		// Primary-key tables: the insert operator buffers the raw rows and writes the data file with
-		// Paimon system columns (_KEY_*, _SEQUENCE_NUMBER, _VALUE_KIND) itself, then merge-on-read
-		// resolves the latest row per key. Feed the data plan directly (no upstream COPY).
-		auto &insert = planner.Make<PaimonInsert>(op, table_entry, op.column_index_map);
-		auto &pk_insert = insert.Cast<PaimonInsert>();
-		pk_insert.pk_mode = true;
-		pk_insert.pk_names = metadata.schema->primary_keys;
-		pk_insert.value_names = names;
-		pk_insert.value_types = types;
-		insert.children.push_back(*plan);
-		return insert;
-	}
-
-	// Append tables: stream value columns through a parquet COPY, then commit.
-	string data_path = table_path + "/bucket-0";
-	auto &physical_copy = PaimonInsert::PlanCopyForInsert(context, planner, data_path, names, types, plan);
-	auto &insert = planner.Make<PaimonInsert>(op, table_entry, op.column_index_map);
-	insert.children.push_back(physical_copy);
-	return insert;
+	auto &paimon_table = op.table.Cast<PaimonTableEntry>();
+	return BuildPaimonInsert(context, planner, paimon_table, op, *plan, op.column_index_map);
 }
 
 PhysicalOperator &PaimonCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
