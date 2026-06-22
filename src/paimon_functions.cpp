@@ -293,6 +293,9 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		}
 	}
 
+	// Invariant: one type per name. The projection loop below and PaimonScanExec both index these in
+	// lockstep, so a mismatch would read past one of them.
+	D_ASSERT(result->return_types.size() == result->names.size());
 	return_types = result->return_types;
 	names = result->names;
 
@@ -669,9 +672,11 @@ static void PaimonScanExec(ClientContext &context, TableFunctionInput &data, Dat
 			    !pk_idx.empty()) {
 				auto &entries = StructVector::GetEntries(output.data[i]);
 				for (idx_t j = 0; j < pk_idx.size(); j++) {
+					D_ASSERT(pk_idx[j] < chunk.ColumnCount());
 					entries[j]->Reference(chunk.data[pk_idx[j]]);
 				}
 			} else if (pk_idx.size() == 1 && out_type == chunk.data[pk_idx[0]].GetType()) {
+				D_ASSERT(pk_idx[0] < chunk.ColumnCount());
 				output.data[i].Reference(chunk.data[pk_idx[0]]);
 			} else {
 				output.data[i].Sequence(0, 1, chunk.size());

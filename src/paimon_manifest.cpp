@@ -253,6 +253,10 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 	unordered_map<FileIdentifier, PaimonManifestEntryParsed, FileIdentifierHash> active_files;
 
 	for (auto &entry : all_entries) {
+		// Bucket and LSM level are physical, non-negative identifiers; a negative value would mean the
+		// manifest decode produced garbage.
+		D_ASSERT(entry.bucket >= 0);
+		D_ASSERT(entry.file.level >= 0);
 		FileIdentifier id{entry.bucket, entry.file.file_name, entry.file.level};
 
 		if (entry.kind == PaimonFileKind::ADD) {
