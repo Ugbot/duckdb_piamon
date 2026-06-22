@@ -1,5 +1,6 @@
 #include "storage/paimon_delete.hpp"
 #include "storage/paimon_insert.hpp"
+#include "paimon_constants.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -144,10 +145,10 @@ SinkFinalizeType PaimonDelete::Finalize(Pipeline &pipeline, Event &event, Client
 	};
 	string projection;
 	for (idx_t j = 0; j < pk_names.size(); j++) {
-		projection += key_col(j) + " AS " + QId("_KEY_" + pk_names[j]) + ", ";
+		projection += key_col(j) + " AS " + QId(paimon::KEY_COLUMN_PREFIX + pk_names[j]) + ", ";
 	}
 	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
-	projection += "CAST(3 AS TINYINT) AS \"_VALUE_KIND\"";
+	projection += "CAST(" + std::to_string((int)paimon::RowKind::DELETE) + " AS TINYINT) AS \"_VALUE_KIND\"";
 	for (idx_t i = 0; i < value_names.size(); i++) {
 		int j = key_index(value_names[i]);
 		if (j >= 0) {

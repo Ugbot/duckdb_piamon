@@ -4,6 +4,7 @@
 #include "paimon_metadata.hpp"
 #include "paimon_manifest.hpp"
 #include "paimon_avro_writer.hpp"
+#include "paimon_constants.hpp"
 #include "iceberg_utils.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
@@ -274,10 +275,10 @@ void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &ta
 
 	string projection;
 	for (auto &pk : pk_names) {
-		projection += quote_id(pk) + " AS " + quote_id("_KEY_" + pk) + ", ";
+		projection += quote_id(pk) + " AS " + quote_id(paimon::KEY_COLUMN_PREFIX + pk) + ", ";
 	}
 	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
-	projection += "CAST(0 AS TINYINT) AS \"_VALUE_KIND\"";
+	projection += "CAST(" + std::to_string((int)paimon::RowKind::INSERT) + " AS TINYINT) AS \"_VALUE_KIND\"";
 	for (auto &v : value_names) {
 		projection += ", " + quote_id(v);
 	}
@@ -517,14 +518,14 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	snapshot_json += "  \"changelogManifestList\": null,\n";
 	snapshot_json += "  \"indexManifest\": null,\n";
 	snapshot_json += "  \"commitUser\": \"duckdb-paimon\",\n";
-	snapshot_json += "  \"commitIdentifier\": 9223372036854775807,\n";
+	snapshot_json += "  \"commitIdentifier\": " + std::to_string(paimon::COMMIT_IDENTIFIER_NONE) + ",\n";
 	snapshot_json += "  \"commitKind\": \"" + commit_kind + "\",\n";
 	snapshot_json += "  \"timeMillis\": " + std::to_string(now_ms) + ",\n";
 	snapshot_json += "  \"logOffsets\": {},\n";
 	snapshot_json += "  \"totalRecordCount\": " + std::to_string(total_rows) + ",\n";
 	snapshot_json += "  \"deltaRecordCount\": " + std::to_string(total_rows) + ",\n";
 	snapshot_json += "  \"changelogRecordCount\": 0,\n";
-	snapshot_json += "  \"watermark\": -9223372036854775808\n";
+	snapshot_json += "  \"watermark\": " + std::to_string(paimon::WATERMARK_NONE) + "\n";
 	snapshot_json += "}";
 
 	// The snapshot file is the atomic commit point: FILE_CREATE_NEW fails if another writer already

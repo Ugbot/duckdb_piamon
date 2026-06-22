@@ -1,6 +1,7 @@
 #include "paimon_manifest.hpp"
 #include "paimon_avro_reader.hpp"
 #include "paimon_binary_row.hpp"
+#include "paimon_constants.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -280,7 +281,7 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		string dir;
 		for (idx_t i = 0; i < partition_keys.size(); i++) {
 			// Paimon names a null partition value with partition.default-name (default below).
-			string v = values[i].IsNull() ? "__DEFAULT_PARTITION__" : values[i].ToString();
+			string v = values[i].IsNull() ? paimon::DEFAULT_PARTITION_NAME : values[i].ToString();
 			dir += partition_keys[i] + "=" + v + "/";
 		}
 		return dir;

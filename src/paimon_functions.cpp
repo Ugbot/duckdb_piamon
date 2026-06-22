@@ -1,6 +1,7 @@
 #include "paimon_functions.hpp"
 #include "paimon_metadata.hpp"
 #include "paimon_manifest.hpp"
+#include "paimon_constants.hpp"
 #include "paimon_multi_file_reader.hpp"
 #include "paimon_multi_file_list.hpp"
 
@@ -65,9 +66,8 @@ static void AddPaimonNamedParameters(TableFunction &fun) {
 // connection at scan time — running it during bind re-enters the engine and deadlocks.
 //===--------------------------------------------------------------------===//
 
-// Paimon RowKind ordinals (org.apache.paimon.types.RowKind): INSERT=0, UPDATE_BEFORE=1,
-// UPDATE_AFTER=2, DELETE=3. A row "exists" if its kind is an add (+I / +U).
-static constexpr const char *VALUE_KIND_KEEP = "(0, 2)";
+// The set of _VALUE_KIND values that survive merge-on-read; see paimon::RowKind in paimon_constants.hpp.
+static constexpr const char *VALUE_KIND_KEEP = paimon::VALUE_KIND_KEEP_SET;
 
 struct PaimonScanBindData : public TableFunctionData {
 	string sql;            // the query to run (empty when there are no files)

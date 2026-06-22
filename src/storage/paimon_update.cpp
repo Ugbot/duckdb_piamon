@@ -1,5 +1,6 @@
 #include "storage/paimon_update.hpp"
 #include "storage/paimon_insert.hpp"
+#include "paimon_constants.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -177,10 +178,11 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 	// New full row per matched key: current row (via paimon_scan), with SET columns overwritten.
 	string projection;
 	for (idx_t j = 0; j < pk_names.size(); j++) {
-		projection += "c." + QId(pk_names[j]) + " AS " + QId("_KEY_" + pk_names[j]) + ", ";
+		projection += "c." + QId(pk_names[j]) + " AS " + QId(paimon::KEY_COLUMN_PREFIX + pk_names[j]) + ", ";
 	}
 	projection += "CAST(" + std::to_string(base_seq) + " + row_number() OVER () AS BIGINT) AS \"_SEQUENCE_NUMBER\", ";
-	projection += "CAST(0 AS TINYINT) AS \"_VALUE_KIND\"";
+	// Written as an upsert (+I); merge-on-read keeps the latest by sequence number.
+	projection += "CAST(" + std::to_string((int)paimon::RowKind::INSERT) + " AS TINYINT) AS \"_VALUE_KIND\"";
 	for (auto &vn : value_names) {
 		int j = updated_index(vn);
 		if (j >= 0) {
