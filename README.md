@@ -169,6 +169,21 @@ DUCKDB_PAIMON_HAVE_GENERATED_DATA=1 build/release/test/unittest "test/sql/local/
 # Spark-derived fixtures additionally need DUCKDB_PAIMON_HAVE_SPARK_DATA=1
 ```
 
+### Running with assertions
+
+The binary parsers and the commit path are written defensively: untrusted input (manifest/data bytes,
+hint files) is validated with runtime `throw`s that are always on, while internal invariants use
+`D_ASSERT`, which compiles out of a Release build. To exercise those assertions, build with them forced
+on and run the same suites against that binary:
+
+```bash
+make relassert VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+# then load build/relassert/.../paimon.duckdb_extension into build/relassert/test/unittest
+```
+
+A truncated/garbage manifest must never crash or read out of bounds — the `corrupt_manifest` fixture
+asserts the reader degrades gracefully (falls back to directory discovery) and still returns all rows.
+
 > **A note on the oracle:** pypaimon's *Python reader* does not implement several features it can
 > *write* — column rename mapping, the non-default merge engines, and branch creation/listing all
 > return wrong or unsupported results there. For those, pypaimon is used as the authoritative *writer*

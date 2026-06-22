@@ -38,11 +38,25 @@ The avro extension requires VCPKG with duckdb's custom avro-c fork:
 
 ```bash
 # 1. Uncomment avro in extension_config.cmake
-# 2. Build with VCPKG:
-make release VCPKG_BUILD=1
+# 2. Build with VCPKG — pass the toolchain path explicitly. VCPKG_BUILD=1 alone does NOT wire in the
+#    toolchain (the avro extension then fails to find its static deps, e.g. libz.a):
+make release VCPKG_TOOLCHAIN_PATH=/Users/bengamble/vcpkg/scripts/buildsystems/vcpkg.cmake
 ```
 
 Without avro, paimon falls back to directory-based file discovery (scans bucket dirs).
+
+### Assertion build (exercise D_ASSERT)
+
+`D_ASSERT` compiles out of Release. To run the suites with internal invariants active, build the
+`relassert` target (RelWithDebInfo + FORCE_ASSERT=1) with the same toolchain path, then load that
+extension into `build/relassert/test/unittest`:
+
+```bash
+make relassert VCPKG_TOOLCHAIN_PATH=/Users/bengamble/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+Defensive convention: untrusted external input (manifest/data bytes, hint files) is validated with
+runtime `throw`s that are always on; only internal "can't happen" invariants use `D_ASSERT`.
 
 ### Extension output
 - `build/release/extension/iceberg/paimon.duckdb_extension`
