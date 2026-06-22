@@ -310,17 +310,178 @@ void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &ta
 // Commit: manifest file + manifest list + snapshot
 //===--------------------------------------------------------------------===//
 
+// Final path component (basename). Manifests store only the basename of each referenced file.
+static string Basename(const string &path) {
+	size_t slash = path.find_last_of('/');
+	return slash == string::npos ? path : path.substr(slash + 1);
+}
+
+// Size of a just-written file, throwing if it is missing or empty — a durability check before anything
+// references it. (Every Avro/JSON file we write is non-empty, so size 0 always means a failed write.)
+static int64_t VerifiedFileSize(FileSystem &fs, const string &path, const char *what) {
+	if (!fs.FileExists(path)) {
+		throw IOException(string("Paimon commit: ") + what + " was not written: " + path);
+	}
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	int64_t size = handle->GetFileSize();
+	if (size == 0) {
+		throw IOException(string("Paimon commit: ") + what + " is empty: " + path);
+	}
+	return size;
+}
+
+static void WriteFileAtomic(FileSystem &fs, const string &path, const string &content) {
+	string tmp_path = path + ".tmp-" + UUID::ToString(UUID::GenerateRandomUUID());
+	{
+		auto handle = fs.OpenFile(tmp_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		handle->Write((void *)content.c_str(), content.size());
+	}
+	fs.MoveFile(tmp_path, path); // rename is atomic on a local filesystem
+}
+
+// Write the delta manifest — one ManifestEntry record per added data file — and return its path.
+static string WriteManifestFile(ClientContext &context, const FileStorePathFactory &pf, const string &uuid,
+                                const vector<PaimonWrittenFile> &written_files) {
+	vector<vector<Value>> entry_rows;
+	for (auto &wf : written_files) {
+		child_list_t<Value> file;
+		file.emplace_back("_FILE_NAME", Value(Basename(wf.file_path)));
+		file.emplace_back("_FILE_SIZE", Value::BIGINT(wf.file_size));
+		file.emplace_back("_ROW_COUNT", Value::BIGINT(wf.row_count));
+		file.emplace_back("_MIN_KEY", EmptyBytes());
+		file.emplace_back("_MAX_KEY", EmptyBytes());
+		file.emplace_back("_KEY_STATS", SimpleStatsValue());
+		file.emplace_back("_VALUE_STATS", SimpleStatsValue());
+		file.emplace_back("_MIN_SEQUENCE_NUMBER", Value::BIGINT(0));
+		file.emplace_back("_MAX_SEQUENCE_NUMBER", Value::BIGINT(0));
+		file.emplace_back("_SCHEMA_ID", Value::BIGINT(0));
+		file.emplace_back("_LEVEL", Value::INTEGER(0));
+		file.emplace_back("_EXTRA_FILES", Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+		file.emplace_back("_CREATION_TIME", Value(LogicalType::BIGINT));
+		file.emplace_back("_DELETE_ROW_COUNT", Value(LogicalType::BIGINT));
+		file.emplace_back("_EMBEDDED_FILE_INDEX", Value(LogicalType::BLOB));
+		file.emplace_back("_FILE_SOURCE", Value(LogicalType::INTEGER));
+		file.emplace_back("_VALUE_STATS_COLS", Value(LogicalType::LIST(LogicalType::VARCHAR)));
+		file.emplace_back("_EXTERNAL_PATH", Value(LogicalType::VARCHAR));
+
+		vector<Value> row;
+		row.push_back(Value::INTEGER(0)); // _KIND = ADD (manifest-entry kind, not RowKind)
+		row.push_back(EmptyBytes());      // _PARTITION (unpartitioned)
+		row.push_back(Value::INTEGER(wf.bucket));
+		row.push_back(Value::INTEGER(1)); // _TOTAL_BUCKETS
+		row.push_back(Value::STRUCT(std::move(file)));
+		entry_rows.push_back(std::move(row));
+	}
+	string path = pf.manifestFilePath(uuid, 0);
+	PaimonAvroWriter::WriteFile(context, path, ManifestEntrySchemaJson(), entry_rows);
+	return path;
+}
+
+// Next snapshot id from the LATEST hint (bare id; legacy "snapshot-N" tolerated). A LATEST that exists
+// but does not parse means the table is corrupt — fail loudly rather than silently resetting to 1
+// (which would clobber snapshot-1 or commit on top of stale state).
+static int64_t ResolveNextSnapshotId(FileSystem &fs, const string &table_path) {
+	string latest_file = table_path + "/snapshot/LATEST";
+	if (!fs.FileExists(latest_file)) {
+		return 1;
+	}
+	auto handle = fs.OpenFile(latest_file, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+	string content(file_size, '\0');
+	handle->Read(&content[0], file_size);
+	StringUtil::Trim(content);
+	if (StringUtil::StartsWith(content, "snapshot-")) {
+		content = content.substr(9);
+	}
+	if (content.empty()) {
+		return 1;
+	}
+	try {
+		return std::stoll(content) + 1;
+	} catch (const std::exception &e) {
+		throw IOException("Paimon commit: LATEST hint is not a valid snapshot id: '" + content + "'");
+	}
+}
+
+// Write the BASE manifest list: every manifest carried forward from the previous snapshot (its base +
+// delta). Without this each commit would only expose its own delta and prior data would vanish. For
+// the first snapshot (or a compaction that replaces the active set) the base list is empty.
+static string WriteBaseManifestList(ClientContext &context, FileSystem &fs, const FileStorePathFactory &pf,
+                                    const string &uuid, const string &table_path, const string &manifest_dir,
+                                    int64_t next_snapshot_id, bool carry_forward) {
+	vector<PaimonManifestFileMeta> carried;
+	if (next_snapshot_id > 1 && carry_forward) {
+		string prev_snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(next_snapshot_id - 1);
+		try {
+			string prev_json = IcebergUtils::FileToString(prev_snapshot_path, fs);
+			auto doc = unique_ptr<yyjson_doc, YyjsonDocDeleter>(yyjson_read(prev_json.c_str(), prev_json.size(), 0));
+			if (doc) {
+				auto root = yyjson_doc_get_root(doc.get());
+				for (const char *key : {"baseManifestList", "deltaManifestList"}) {
+					auto v = yyjson_obj_get(root, key);
+					if (v && yyjson_is_str(v)) {
+						string list_name = yyjson_get_str(v);
+						if (!list_name.empty()) {
+							for (auto &m : ReadPaimonManifestList(context, manifest_dir + "/" + list_name)) {
+								carried.push_back(m);
+							}
+						}
+					}
+				}
+			}
+		} catch (const std::exception &e) {
+			throw IOException("Failed to carry forward manifests from previous snapshot: " + string(e.what()));
+		}
+	}
+
+	vector<vector<Value>> base_rows;
+	for (auto &m : carried) {
+		vector<Value> row;
+		row.push_back(Value(m.file_name));
+		row.push_back(Value::BIGINT(m.file_size));
+		row.push_back(Value::BIGINT(m.num_added_files));
+		row.push_back(Value::BIGINT(m.num_deleted_files));
+		row.push_back(SimpleStatsValue());
+		row.push_back(Value::BIGINT(m.schema_id));
+		base_rows.push_back(std::move(row));
+	}
+	string path = pf.manifestListFilePath(uuid, 1);
+	PaimonAvroWriter::WriteFile(context, path, ManifestListSchemaJson(), base_rows);
+	return path;
+}
+
+// The Paimon v3 snapshot JSON for this commit.
+static string BuildSnapshotJson(int64_t snapshot_id, const string &base_list_filename,
+                                const string &delta_list_filename, int64_t delta_list_size,
+                                const string &commit_kind, idx_t total_rows, int64_t now_ms) {
+	string j = "{\n";
+	j += "  \"version\": 3,\n";
+	j += "  \"id\": " + std::to_string(snapshot_id) + ",\n";
+	j += "  \"schemaId\": 0,\n";
+	j += "  \"baseManifestList\": \"" + base_list_filename + "\",\n";
+	j += "  \"deltaManifestList\": \"" + delta_list_filename + "\",\n";
+	j += "  \"deltaManifestListSize\": " + std::to_string(delta_list_size) + ",\n";
+	j += "  \"changelogManifestList\": null,\n";
+	j += "  \"indexManifest\": null,\n";
+	j += "  \"commitUser\": \"duckdb-paimon\",\n";
+	j += "  \"commitIdentifier\": " + std::to_string(paimon::COMMIT_IDENTIFIER_NONE) + ",\n";
+	j += "  \"commitKind\": \"" + commit_kind + "\",\n";
+	j += "  \"timeMillis\": " + std::to_string(now_ms) + ",\n";
+	j += "  \"logOffsets\": {},\n";
+	j += "  \"totalRecordCount\": " + std::to_string(total_rows) + ",\n";
+	j += "  \"deltaRecordCount\": " + std::to_string(total_rows) + ",\n";
+	j += "  \"changelogRecordCount\": 0,\n";
+	j += "  \"watermark\": " + std::to_string(paimon::WATERMARK_NONE) + "\n";
+	j += "}";
+	return j;
+}
+
 void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &table_path,
                                       const vector<PaimonWrittenFile> &written_files, idx_t total_rows,
                                       bool carry_forward, const string &commit_kind) {
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 	FileStorePathFactory path_factory(table_path, 1);
 
-	// Avro writes (COPY ... TO ... (FORMAT AVRO)) must run on a SEPARATE connection: issuing them on
-	// the current context during Finalize re-enters the engine and deadlocks.
-	Connection conn(DatabaseInstance::GetDatabase(context));
-
-	// Ensure directories exist
 	string manifest_dir = table_path + "/manifest";
 	string snapshot_dir = table_path + "/snapshot";
 	if (!fs.DirectoryExists(manifest_dir)) {
@@ -333,73 +494,15 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 	string manifest_uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	string manifest_list_uuid = UUID::ToString(UUID::GenerateRandomUUID());
 
-	// Step 1: Write the manifest file (Avro) natively — one ManifestEntry record per added data file.
-	string manifest_file_path = path_factory.manifestFilePath(manifest_uuid, 0);
-	{
-		vector<vector<Value>> entry_rows;
-		for (auto &wf : written_files) {
-			// Manifests store only the data file's basename; readers reconstruct the full path from
-			// the table location + partition dir + bucket-N.
-			string relative_path = wf.file_path;
-			size_t last_slash = relative_path.find_last_of('/');
-			if (last_slash != string::npos) {
-				relative_path = relative_path.substr(last_slash + 1);
-			}
-			child_list_t<Value> file;
-			file.emplace_back("_FILE_NAME", Value(relative_path));
-			file.emplace_back("_FILE_SIZE", Value::BIGINT(wf.file_size));
-			file.emplace_back("_ROW_COUNT", Value::BIGINT(wf.row_count));
-			file.emplace_back("_MIN_KEY", EmptyBytes());
-			file.emplace_back("_MAX_KEY", EmptyBytes());
-			file.emplace_back("_KEY_STATS", SimpleStatsValue());
-			file.emplace_back("_VALUE_STATS", SimpleStatsValue());
-			file.emplace_back("_MIN_SEQUENCE_NUMBER", Value::BIGINT(0));
-			file.emplace_back("_MAX_SEQUENCE_NUMBER", Value::BIGINT(0));
-			file.emplace_back("_SCHEMA_ID", Value::BIGINT(0));
-			file.emplace_back("_LEVEL", Value::INTEGER(0));
-			file.emplace_back("_EXTRA_FILES", Value::LIST(LogicalType::VARCHAR, vector<Value>()));
-			file.emplace_back("_CREATION_TIME", Value(LogicalType::BIGINT));
-			file.emplace_back("_DELETE_ROW_COUNT", Value(LogicalType::BIGINT));
-			file.emplace_back("_EMBEDDED_FILE_INDEX", Value(LogicalType::BLOB));
-			file.emplace_back("_FILE_SOURCE", Value(LogicalType::INTEGER));
-			file.emplace_back("_VALUE_STATS_COLS", Value(LogicalType::LIST(LogicalType::VARCHAR)));
-			file.emplace_back("_EXTERNAL_PATH", Value(LogicalType::VARCHAR));
+	// Step 1: delta manifest (entries for the new files). Must be durable before it is referenced.
+	string manifest_file_path = WriteManifestFile(context, path_factory, manifest_uuid, written_files);
+	int64_t manifest_file_size = VerifiedFileSize(fs, manifest_file_path, "manifest file");
 
-			vector<Value> row;
-			row.push_back(Value::INTEGER(0)); // _KIND = ADD
-			row.push_back(EmptyBytes());      // _PARTITION (unpartitioned)
-			row.push_back(Value::INTEGER(wf.bucket));
-			row.push_back(Value::INTEGER(1)); // _TOTAL_BUCKETS
-			row.push_back(Value::STRUCT(std::move(file)));
-			entry_rows.push_back(std::move(row));
-		}
-		PaimonAvroWriter::WriteFile(context, manifest_file_path, ManifestEntrySchemaJson(), entry_rows);
-	}
-
-	// The manifest must be on disk and non-empty before anything references it; a silent write failure
-	// here would otherwise produce a snapshot pointing at a missing/empty manifest.
-	if (!fs.FileExists(manifest_file_path)) {
-		throw IOException("Paimon commit: manifest file was not written: " + manifest_file_path);
-	}
-	int64_t manifest_file_size = 0;
-	{
-		auto handle = fs.OpenFile(manifest_file_path, FileFlags::FILE_FLAGS_READ);
-		manifest_file_size = handle->GetFileSize();
-	}
-	if (manifest_file_size == 0) {
-		throw IOException("Paimon commit: manifest file is empty: " + manifest_file_path);
-	}
-
-	// Step 2: Write the delta manifest list (Avro) natively, referencing the new manifest file.
+	// Step 2: delta manifest list referencing that manifest.
 	string manifest_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 0);
 	{
-		string manifest_filename = manifest_file_path;
-		size_t last_slash = manifest_filename.find_last_of('/');
-		if (last_slash != string::npos) {
-			manifest_filename = manifest_filename.substr(last_slash + 1);
-		}
 		vector<Value> row;
-		row.push_back(Value(manifest_filename));
+		row.push_back(Value(Basename(manifest_file_path)));
 		row.push_back(Value::BIGINT(manifest_file_size));
 		row.push_back(Value::BIGINT((int64_t)written_files.size()));
 		row.push_back(Value::BIGINT(0));
@@ -407,126 +510,21 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		row.push_back(Value::BIGINT(0));
 		PaimonAvroWriter::WriteFile(context, manifest_list_path, ManifestListSchemaJson(), {row});
 	}
+	int64_t manifest_list_size = VerifiedFileSize(fs, manifest_list_path, "manifest list");
 
-	// The delta manifest list must likewise be durable before the snapshot references it.
-	if (!fs.FileExists(manifest_list_path)) {
-		throw IOException("Paimon commit: manifest list was not written: " + manifest_list_path);
-	}
-	int64_t manifest_list_size = 0;
-	{
-		auto handle = fs.OpenFile(manifest_list_path, FileFlags::FILE_FLAGS_READ);
-		manifest_list_size = handle->GetFileSize();
-	}
-
-	// Determine the next snapshot id from the LATEST hint (bare id, with legacy "snapshot-N" tolerated).
-	// A LATEST that exists but does not parse means the table is corrupt — fail loudly rather than
-	// silently resetting to id 1 (which would clobber snapshot-1 or commit on top of stale state).
-	int64_t next_snapshot_id = 1;
-	string latest_file = table_path + "/snapshot/LATEST";
-	if (fs.FileExists(latest_file)) {
-		auto handle = fs.OpenFile(latest_file, FileFlags::FILE_FLAGS_READ);
-		auto file_size = handle->GetFileSize();
-		string content(file_size, '\0');
-		handle->Read(&content[0], file_size);
-		StringUtil::Trim(content);
-		if (StringUtil::StartsWith(content, "snapshot-")) {
-			content = content.substr(9);
-		}
-		if (!content.empty()) {
-			try {
-				next_snapshot_id = std::stoll(content) + 1;
-			} catch (const std::exception &e) {
-				throw IOException("Paimon commit: LATEST hint is not a valid snapshot id: '" + content + "'");
-			}
-		}
-	}
+	// Step 3: base manifest list (carry-forward) + the next snapshot id.
+	int64_t next_snapshot_id = ResolveNextSnapshotId(fs, table_path);
 	int64_t prev_snapshot_id = next_snapshot_id - 1;
+	string base_list_path = WriteBaseManifestList(context, fs, path_factory, manifest_list_uuid, table_path,
+	                                               manifest_dir, next_snapshot_id, carry_forward);
 
-	// Step 2b: Write the BASE manifest list = all manifests carried forward from the previous snapshot
-	// (its base + delta). Without this, each commit would only expose its own delta and prior data
-	// would vanish. For the first snapshot (or compaction) the base list is empty.
-	string base_list_path = path_factory.manifestListFilePath(manifest_list_uuid, 1);
-	{
-		vector<PaimonManifestFileMeta> carried;
-		if (next_snapshot_id > 1 && carry_forward) {
-			string prev_snapshot_path = table_path + "/snapshot/snapshot-" + std::to_string(next_snapshot_id - 1);
-			try {
-				string prev_json = IcebergUtils::FileToString(prev_snapshot_path, fs);
-				auto doc = unique_ptr<yyjson_doc, YyjsonDocDeleter>(
-				    yyjson_read(prev_json.c_str(), prev_json.size(), 0));
-				if (doc) {
-					auto root = yyjson_doc_get_root(doc.get());
-					for (const char *key : {"baseManifestList", "deltaManifestList"}) {
-						auto v = yyjson_obj_get(root, key);
-						if (v && yyjson_is_str(v)) {
-							string list_name = yyjson_get_str(v);
-							if (!list_name.empty()) {
-								auto metas = ReadPaimonManifestList(context, manifest_dir + "/" + list_name);
-								for (auto &m : metas) {
-									carried.push_back(m);
-								}
-							}
-						}
-					}
-				}
-			} catch (const std::exception &e) {
-				throw IOException("Failed to carry forward manifests from previous snapshot: " + string(e.what()));
-			}
-		}
-
-		vector<vector<Value>> base_rows;
-		for (auto &m : carried) {
-			vector<Value> row;
-			row.push_back(Value(m.file_name));
-			row.push_back(Value::BIGINT(m.file_size));
-			row.push_back(Value::BIGINT(m.num_added_files));
-			row.push_back(Value::BIGINT(m.num_deleted_files));
-			row.push_back(SimpleStatsValue());
-			row.push_back(Value::BIGINT(m.schema_id));
-			base_rows.push_back(std::move(row));
-		}
-		PaimonAvroWriter::WriteFile(context, base_list_path, ManifestListSchemaJson(), base_rows);
-	}
-	string base_list_filename = base_list_path;
-	{
-		size_t last_slash = base_list_filename.find_last_of('/');
-		if (last_slash != string::npos) {
-			base_list_filename = base_list_filename.substr(last_slash + 1);
-		}
-	}
-
-	// Extract manifest list filename for JSON
-	string manifest_list_filename = manifest_list_path;
-	{
-		size_t last_slash = manifest_list_filename.find_last_of('/');
-		if (last_slash != string::npos) {
-			manifest_list_filename = manifest_list_filename.substr(last_slash + 1);
-		}
-	}
-
-	// Step 4: Write snapshot JSON
+	// Step 4: snapshot JSON.
 	auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-	    std::chrono::system_clock::now().time_since_epoch()).count();
-
-	string snapshot_json = "{\n";
-	snapshot_json += "  \"version\": 3,\n";
-	snapshot_json += "  \"id\": " + std::to_string(next_snapshot_id) + ",\n";
-	snapshot_json += "  \"schemaId\": 0,\n";
-	snapshot_json += "  \"baseManifestList\": \"" + base_list_filename + "\",\n";
-	snapshot_json += "  \"deltaManifestList\": \"" + manifest_list_filename + "\",\n";
-	snapshot_json += "  \"deltaManifestListSize\": " + std::to_string(manifest_list_size) + ",\n";
-	snapshot_json += "  \"changelogManifestList\": null,\n";
-	snapshot_json += "  \"indexManifest\": null,\n";
-	snapshot_json += "  \"commitUser\": \"duckdb-paimon\",\n";
-	snapshot_json += "  \"commitIdentifier\": " + std::to_string(paimon::COMMIT_IDENTIFIER_NONE) + ",\n";
-	snapshot_json += "  \"commitKind\": \"" + commit_kind + "\",\n";
-	snapshot_json += "  \"timeMillis\": " + std::to_string(now_ms) + ",\n";
-	snapshot_json += "  \"logOffsets\": {},\n";
-	snapshot_json += "  \"totalRecordCount\": " + std::to_string(total_rows) + ",\n";
-	snapshot_json += "  \"deltaRecordCount\": " + std::to_string(total_rows) + ",\n";
-	snapshot_json += "  \"changelogRecordCount\": 0,\n";
-	snapshot_json += "  \"watermark\": " + std::to_string(paimon::WATERMARK_NONE) + "\n";
-	snapshot_json += "}";
+	                  std::chrono::system_clock::now().time_since_epoch())
+	                  .count();
+	string snapshot_json = BuildSnapshotJson(next_snapshot_id, Basename(base_list_path),
+	                                         Basename(manifest_list_path), manifest_list_size, commit_kind,
+	                                         total_rows, now_ms);
 
 	// The snapshot file is the atomic commit point: FILE_CREATE_NEW fails if another writer already
 	// committed this id, so two concurrent commits can't clobber each other.
@@ -537,9 +535,8 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		handle->Write((void *)snapshot_json.c_str(), snapshot_json.size());
 	}
 
-	// Durability barrier: the snapshot must be fully on disk before LATEST is advanced to it. Otherwise
-	// a partial snapshot write followed by the LATEST flip leaves readers pointing at a truncated
-	// snapshot — catalog corruption. Re-open and verify the byte count matches what we wrote.
+	// Durability barrier: the snapshot must be fully on disk before LATEST advances to it. A partial
+	// snapshot write followed by the LATEST flip leaves readers pointing at a truncated snapshot.
 	{
 		auto handle = fs.OpenFile(snapshot_path, FileFlags::FILE_FLAGS_READ);
 		if (handle->GetFileSize() != (int64_t)snapshot_json.size()) {
@@ -548,24 +545,12 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		}
 	}
 
-	// Step 5: Update the LATEST hint atomically (write a temp file, then rename over it) so a reader
-	// never observes a partially written pointer. Paimon hint files hold the bare snapshot id.
-	auto write_hint_atomic = [&](const string &hint_path, const string &content) {
-		string tmp_path = hint_path + ".tmp-" + UUID::ToString(UUID::GenerateRandomUUID());
-		{
-			auto handle = fs.OpenFile(tmp_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
-			handle->Write((void *)content.c_str(), content.size());
-		}
-		fs.MoveFile(tmp_path, hint_path); // rename is atomic on a local filesystem
-	};
-	write_hint_atomic(latest_file, std::to_string(next_snapshot_id));
-
-	// EARLIEST always points at the oldest retained snapshot; (re)write it to the bare id.
+	// Step 5: advance LATEST atomically (temp + rename) so a reader never sees a partial pointer; seed
+	// EARLIEST on the first commit.
+	WriteFileAtomic(fs, table_path + "/snapshot/LATEST", std::to_string(next_snapshot_id));
 	string earliest_file = table_path + "/snapshot/EARLIEST";
 	if (!fs.FileExists(earliest_file)) {
-		string earliest_content = std::to_string(next_snapshot_id);
-		auto handle = fs.OpenFile(earliest_file, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
-		handle->Write((void *)earliest_content.c_str(), earliest_content.size());
+		WriteFileAtomic(fs, earliest_file, std::to_string(next_snapshot_id));
 	}
 }
 
