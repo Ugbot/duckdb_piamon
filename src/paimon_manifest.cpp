@@ -7,6 +7,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
@@ -137,6 +139,129 @@ vector<PaimonManifestEntryParsed> ReadPaimonManifestFile(ClientContext &context,
 // Compute Active Data Files from Manifests
 //===--------------------------------------------------------------------===//
 
+// A data file's identity within a table: (bucket, file name, LSM level).
+namespace {
+struct ActiveFileId {
+	int32_t bucket;
+	string file_name;
+	int32_t level;
+	bool operator==(const ActiveFileId &o) const {
+		return bucket == o.bucket && file_name == o.file_name && level == o.level;
+	}
+};
+struct ActiveFileIdHash {
+	size_t operator()(const ActiveFileId &id) const {
+		size_t h = std::hash<int32_t>()(id.bucket);
+		h ^= std::hash<string>()(id.file_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		h ^= std::hash<int32_t>()(id.level) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		return h;
+	}
+};
+} // namespace
+
+// Resolves a path within the table, falling back to the main table root for a branch (see
+// ComputeActiveDataFiles). Identity for a non-branch table.
+using PathResolver = std::function<string(const string &)>;
+
+// Read every manifest entry referenced by a snapshot's base + delta manifest lists (base first, the
+// accumulated state; then the delta).
+static vector<PaimonManifestEntryParsed> CollectManifestEntries(ClientContext &context, const string &table_location,
+                                                                FileSystem &fs, const PathResolver &resolve,
+                                                                const string &base_list, const string &delta_list) {
+	vector<string> manifest_file_paths;
+	auto read_manifest_list = [&](const string &ref) {
+		if (ref.empty()) {
+			return;
+		}
+		string list_path = (StringUtil::StartsWith(ref, "/") || ref.find("://") != string::npos)
+		                        ? ref
+		                        : resolve(table_location + "/manifest/" + ref);
+		if (!fs.FileExists(list_path)) {
+			return;
+		}
+		for (auto &meta : ReadPaimonManifestList(context, list_path)) {
+			bool absolute = StringUtil::StartsWith(meta.file_name, "/") || meta.file_name.find("://") != string::npos;
+			manifest_file_paths.push_back(absolute ? meta.file_name
+			                                       : resolve(table_location + "/manifest/" + meta.file_name));
+		}
+	};
+	read_manifest_list(base_list);
+	read_manifest_list(delta_list);
+
+	vector<PaimonManifestEntryParsed> all_entries;
+	for (auto &manifest_path : manifest_file_paths) {
+		if (!fs.FileExists(manifest_path)) {
+			continue;
+		}
+		for (auto &entry : ReadPaimonManifestFile(context, manifest_path)) {
+			all_entries.push_back(std::move(entry));
+		}
+	}
+	return all_entries;
+}
+
+// The net-active file set: an ADD entry adds a file, a later DELETE for the same identity removes it.
+static vector<PaimonManifestEntryParsed> ComputeActiveSet(const vector<PaimonManifestEntryParsed> &all_entries) {
+	unordered_map<ActiveFileId, PaimonManifestEntryParsed, ActiveFileIdHash> active_files;
+	for (auto &entry : all_entries) {
+		// Bucket and LSM level are physical, non-negative identifiers; a negative value would mean the
+		// manifest decode produced garbage.
+		D_ASSERT(entry.bucket >= 0);
+		D_ASSERT(entry.file.level >= 0);
+		ActiveFileId id {entry.bucket, entry.file.file_name, entry.file.level};
+		if (entry.kind == PaimonFileKind::ADD) {
+			active_files[id] = entry;
+		} else {
+			active_files.erase(id);
+		}
+	}
+	vector<PaimonManifestEntryParsed> result;
+	result.reserve(active_files.size());
+	for (auto &kv : active_files) {
+		result.push_back(kv.second);
+	}
+	return result;
+}
+
+// Resolve each active entry to an absolute data-file path: {table}/[partition=.../]bucket-N/<file>,
+// reconstructing the Hive-style partition directory from the manifest's _PARTITION BinaryRow.
+static vector<string> ResolveDataFilePaths(const vector<PaimonManifestEntryParsed> &active,
+                                           const string &table_location, const vector<string> &partition_keys,
+                                           const vector<PaimonDataType> &partition_types,
+                                           const PathResolver &resolve) {
+	auto partition_dir = [&](const string &partition_bytes) -> string {
+		if (partition_keys.empty() || partition_bytes.empty()) {
+			return "";
+		}
+		auto values = PaimonBinaryRow::DecodeSerialized(partition_bytes, partition_types);
+		if (values.size() != partition_keys.size()) {
+			return "";
+		}
+		string dir;
+		for (idx_t i = 0; i < partition_keys.size(); i++) {
+			// Paimon names a null partition value with partition.default-name.
+			string v = values[i].IsNull() ? paimon::DEFAULT_PARTITION_NAME : values[i].ToString();
+			dir += partition_keys[i] + "=" + v + "/";
+		}
+		return dir;
+	};
+
+	vector<string> result;
+	result.reserve(active.size());
+	for (auto &entry : active) {
+		const string &name = entry.file.file_name;
+		if (StringUtil::StartsWith(name, "/") || name.find("://") != string::npos) {
+			result.push_back(name); // already absolute
+		} else if (name.find("bucket-") != string::npos || name.find("/") != string::npos) {
+			result.push_back(resolve(table_location + "/" + name)); // already has directory structure
+		} else {
+			result.push_back(resolve(table_location + "/" + partition_dir(entry.partition) + "bucket-" +
+			                         std::to_string(entry.bucket) + "/" + name)); // bare filename
+		}
+	}
+	return result;
+}
+
 vector<string> ComputeActiveDataFiles(ClientContext &context, const string &table_location,
                                       const string &base_manifest_list, const string &delta_manifest_list,
                                       const PaimonSchema *schema) {
@@ -144,14 +269,14 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 
 	// Branch support: a named branch (table_location ends in .../branch/branch-<name>) keeps its own
 	// snapshot + schema but SHARES the main table's manifest and data files, matching Paimon's
-	// branch-aware path resolution. Resolve each metadata/data path within the branch dir first, and
-	// fall back to the equivalent path under the main table root when it is not present there.
+	// branch-aware path resolution. Resolve each path within the branch dir first, falling back to the
+	// equivalent path under the main table root when it is not present there.
 	string main_root = table_location;
 	auto branch_pos = table_location.find("/branch/branch-");
 	if (branch_pos != string::npos) {
 		main_root = table_location.substr(0, branch_pos);
 	}
-	auto resolve = [&](const string &p) -> string {
+	PathResolver resolve = [&fs, main_root, table_location](const string &p) -> string {
 		if (main_root == table_location || fs.FileExists(p)) {
 			return p; // not a branch, or the branch already has its own copy
 		}
@@ -164,8 +289,7 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		return p;
 	};
 
-	// Resolve the partition-key field types (in partition-key order) so we can decode the
-	// _PARTITION BinaryRow into the Hive-style partition directory (key=value/...).
+	// Partition-key field types (in partition-key order), used to decode the _PARTITION BinaryRow.
 	vector<string> partition_keys;
 	vector<PaimonDataType> partition_types;
 	if (schema) {
@@ -180,143 +304,10 @@ vector<string> ComputeActiveDataFiles(ClientContext &context, const string &tabl
 		}
 	}
 
-	// Collect all manifest file paths from both base and delta manifest lists
-	vector<string> manifest_file_paths;
-
-	auto read_manifest_list = [&](const string &manifest_list_ref) {
-		if (manifest_list_ref.empty()) {
-			return;
-		}
-
-		// Resolve the manifest list path (could be relative to manifest/ directory)
-		string manifest_list_path;
-		if (StringUtil::StartsWith(manifest_list_ref, "/") || manifest_list_ref.find("://") != string::npos) {
-			manifest_list_path = manifest_list_ref;
-		} else {
-			manifest_list_path = resolve(table_location + "/manifest/" + manifest_list_ref);
-		}
-
-		if (!fs.FileExists(manifest_list_path)) {
-			return;
-		}
-
-		auto metas = ReadPaimonManifestList(context, manifest_list_path);
-		for (auto &meta : metas) {
-			// Resolve manifest file path
-			string manifest_path;
-			if (StringUtil::StartsWith(meta.file_name, "/") || meta.file_name.find("://") != string::npos) {
-				manifest_path = meta.file_name;
-			} else {
-				manifest_path = resolve(table_location + "/manifest/" + meta.file_name);
-			}
-			manifest_file_paths.push_back(manifest_path);
-		}
-	};
-
-	// Read base manifest list first (accumulated state), then delta (this snapshot's additions)
-	read_manifest_list(base_manifest_list);
-	read_manifest_list(delta_manifest_list);
-
-	// Read all manifest files and collect entries
-	vector<PaimonManifestEntryParsed> all_entries;
-	for (auto &manifest_path : manifest_file_paths) {
-		if (!fs.FileExists(manifest_path)) {
-			continue;
-		}
-		auto entries = ReadPaimonManifestFile(context, manifest_path);
-		for (auto &entry : entries) {
-			all_entries.push_back(std::move(entry));
-		}
-	}
-
-	// Merge ADD/DELETE entries to compute active file set
-	// Key: (bucket, file_name) → entry
-	// Process in order: ADD puts file in set, DELETE removes it
-	struct FileIdentifier {
-		int32_t bucket;
-		string file_name;
-		int32_t level;
-
-		bool operator==(const FileIdentifier &other) const {
-			return bucket == other.bucket && file_name == other.file_name && level == other.level;
-		}
-	};
-
-	struct FileIdentifierHash {
-		size_t operator()(const FileIdentifier &id) const {
-			size_t h = std::hash<int32_t>()(id.bucket);
-			h ^= std::hash<string>()(id.file_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
-			h ^= std::hash<int32_t>()(id.level) + 0x9e3779b9 + (h << 6) + (h >> 2);
-			return h;
-		}
-	};
-
-	unordered_map<FileIdentifier, PaimonManifestEntryParsed, FileIdentifierHash> active_files;
-
-	for (auto &entry : all_entries) {
-		// Bucket and LSM level are physical, non-negative identifiers; a negative value would mean the
-		// manifest decode produced garbage.
-		D_ASSERT(entry.bucket >= 0);
-		D_ASSERT(entry.file.level >= 0);
-		FileIdentifier id{entry.bucket, entry.file.file_name, entry.file.level};
-
-		if (entry.kind == PaimonFileKind::ADD) {
-			active_files[id] = entry;
-		} else {
-			// DELETE cancels a previous ADD
-			active_files.erase(id);
-		}
-	}
-
-	// Build the Hive-style partition directory ("dt=2024-01-01/", possibly multi-level) from the
-	// manifest's _PARTITION BinaryRow. Returns "" for unpartitioned tables / undecodable partitions.
-	auto partition_dir = [&](const string &partition_bytes) -> string {
-		if (partition_keys.empty() || partition_bytes.empty()) {
-			return "";
-		}
-		auto values = PaimonBinaryRow::DecodeSerialized(partition_bytes, partition_types);
-		if (values.size() != partition_keys.size()) {
-			return "";
-		}
-		string dir;
-		for (idx_t i = 0; i < partition_keys.size(); i++) {
-			// Paimon names a null partition value with partition.default-name (default below).
-			string v = values[i].IsNull() ? paimon::DEFAULT_PARTITION_NAME : values[i].ToString();
-			dir += partition_keys[i] + "=" + v + "/";
-		}
-		return dir;
-	};
-
-	// Convert active files to absolute paths
-	vector<string> result;
-	result.reserve(active_files.size());
-
-	for (auto &kv : active_files) {
-		auto &entry = kv.second;
-		string file_path;
-
-		// The file_name in a manifest entry is relative to the bucket directory
-		// Full path: {table_location}/[{partition_path}/]bucket-{N}/{file_name}
-		// The file_name field might already include the bucket prefix or be just the filename
-
-		if (StringUtil::StartsWith(entry.file.file_name, "/") ||
-		    entry.file.file_name.find("://") != string::npos) {
-			// Absolute path
-			file_path = entry.file.file_name;
-		} else if (entry.file.file_name.find("bucket-") != string::npos ||
-		           entry.file.file_name.find("/") != string::npos) {
-			// Already has directory structure (e.g., "bucket-0/data-xxx.parquet" or "dt=.../bucket-0/...")
-			file_path = resolve(table_location + "/" + entry.file.file_name);
-		} else {
-			// Just a filename — place it under [partition_dir/]bucket-{N}/.
-			file_path = resolve(table_location + "/" + partition_dir(entry.partition) + "bucket-" +
-			                    std::to_string(entry.bucket) + "/" + entry.file.file_name);
-		}
-
-		result.push_back(file_path);
-	}
-
-	return result;
+	auto all_entries =
+	    CollectManifestEntries(context, table_location, fs, resolve, base_manifest_list, delta_manifest_list);
+	auto active = ComputeActiveSet(all_entries);
+	return ResolveDataFilePaths(active, table_location, partition_keys, partition_types, resolve);
 }
 
 } // namespace duckdb
