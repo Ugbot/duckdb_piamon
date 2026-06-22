@@ -116,6 +116,14 @@ SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/de
 ----
 ORC data files
 
+# --- Parser safety: a table with a truncated/garbage manifest (Avro magic + an absurd varint length)
+# must not crash or read out of bounds. The reader degrades gracefully to directory-based discovery and
+# still returns every row. (TigerStyle: malformed external input is always handled cleanly.) ---
+query I
+SELECT count(*) FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon/default.db/corrupt_manifest');
+----
+20
+
 # --- Catalog ATTACH + catalog-integrated scan ---
 statement ok
 ATTACH '__WORKING_DIRECTORY__/data/generated/paimon/default.db' AS pm (TYPE paimon);

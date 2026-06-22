@@ -350,6 +350,22 @@ def main():
             print(f"  [FAIL] {gen.__name__}: {e}")
             raise
 
+    # Parser-safety fixture: a copy of the append table with a deliberately truncated/garbage manifest
+    # file. The reader must degrade gracefully (fall back to directory discovery) and still return all
+    # rows, never crash or read out of bounds on the malformed Avro — a TigerStyle parser-safety check.
+    import glob
+    src = os.path.join(warehouse, f"{db}.db", "append_simple")
+    dst = os.path.join(warehouse, f"{db}.db", "corrupt_manifest")
+    if os.path.isdir(src):
+        shutil.copytree(src, dst)
+        for m in glob.glob(os.path.join(dst, "manifest", "manifest-*")):
+            if "manifest-list" not in os.path.basename(m):
+                with open(m, "wb") as fh:
+                    fh.write(b"Obj\x01\xff\xff\xff\x7f")  # Avro magic + an absurd varint length
+                break
+        results.append(("corrupt_manifest", 20))
+        print("  [ok] corrupt_manifest: 20 rows (truncated manifest, expect graceful fallback)")
+
     print(f"\nPaimon fixtures written to: {warehouse}")
     print("Tables:", ", ".join(r[0] for r in results))
 

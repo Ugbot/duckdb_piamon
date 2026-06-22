@@ -22,12 +22,30 @@ namespace {
 struct ByteCursor {
 	const_data_ptr_t p;
 	const_data_ptr_t end;
+	// Bytes remaining in the buffer. The (p <= end) invariant holds for every cursor we construct, so
+	// this subtraction never underflows — unlike `p + n > end`, which is UB when `n` is attacker-large.
+	idx_t Remaining() const {
+		D_ASSERT(p <= end);
+		return (idx_t)(end - p);
+	}
 	void Check(idx_t n) const {
-		if (p + n > end) {
+		if (n > Remaining()) {
 			throw IOException("Avro decode overran block buffer");
 		}
 	}
 };
+
+// Validate a length/count decoded from the (untrusted) stream before it is used to index, copy, or
+// allocate: it must be non-negative and cannot exceed the bytes left in the buffer. A length larger
+// than the remaining input is always malformed, and an element count cannot exceed the byte count
+// because every element occupies at least one byte (the manifest/data schemas have no zero-width
+// elements). This is a hard runtime check, not a D_ASSERT — malformed files reach this in release.
+idx_t CheckedLength(const ByteCursor &c, int64_t len, const char *what) {
+	if (len < 0 || (uint64_t)len > c.Remaining()) {
+		throw IOException(string("Avro ") + what + " length/count out of range (corrupt file)");
+	}
+	return (idx_t)len;
+}
 
 int64_t DecodeLong(ByteCursor &c) {
 	uint64_t v = 0;
@@ -86,16 +104,14 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 		return Value::DOUBLE(d);
 	}
 	case AvroKind::BYTES: {
-		int64_t len = DecodeLong(c);
-		c.Check((idx_t)len);
-		Value v = Value::BLOB(c.p, (idx_t)len);
+		idx_t len = CheckedLength(c, DecodeLong(c), "bytes");
+		Value v = Value::BLOB(c.p, len);
 		c.p += len;
 		return v;
 	}
 	case AvroKind::STRING: {
-		int64_t len = DecodeLong(c);
-		c.Check((idx_t)len);
-		string s((const char *)c.p, (idx_t)len);
+		idx_t len = CheckedLength(c, DecodeLong(c), "string");
+		string s((const char *)c.p, len);
 		c.p += len;
 		return Value(s);
 	}
@@ -117,6 +133,9 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 		return DecodeValue(c, *type.branches[branch]);
 	}
 	case AvroKind::ARRAY: {
+		// Avro arrays are a sequence of blocks terminated by a zero count. Each block-count read
+		// consumes at least one byte and CheckedLength bounds the count by the bytes left, so the
+		// loop is bounded by the buffer size and cannot spin or over-allocate on malformed input.
 		vector<Value> items;
 		while (true) {
 			int64_t count = DecodeLong(c);
@@ -127,7 +146,8 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 				count = -count;
 				DecodeLong(c); // block byte size (ignored)
 			}
-			for (int64_t i = 0; i < count; i++) {
+			idx_t n = CheckedLength(c, count, "array block");
+			for (idx_t i = 0; i < n; i++) {
 				items.push_back(DecodeValue(c, *type.items));
 			}
 		}
@@ -136,6 +156,7 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 	}
 	case AvroKind::MAP: {
 		// Decode into a LIST of STRUCT(key,value) — not used by the manifest parsers, but consumed.
+		// Bounded for the same reason as ARRAY above.
 		vector<Value> entries;
 		while (true) {
 			int64_t count = DecodeLong(c);
@@ -146,10 +167,10 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 				count = -count;
 				DecodeLong(c);
 			}
-			for (int64_t i = 0; i < count; i++) {
-				int64_t klen = DecodeLong(c);
-				c.Check((idx_t)klen);
-				string key((const char *)c.p, (idx_t)klen);
+			idx_t n = CheckedLength(c, count, "map block");
+			for (idx_t i = 0; i < n; i++) {
+				idx_t klen = CheckedLength(c, DecodeLong(c), "map key");
+				string key((const char *)c.p, klen);
 				c.p += klen;
 				child_list_t<Value> kv;
 				kv.emplace_back("key", Value(key));
@@ -190,14 +211,13 @@ PaimonAvroReader::PaimonAvroReader(ClientContext &context, const string &path) {
 			count = -count;
 			DecodeLong(c); // block size
 		}
-		for (int64_t i = 0; i < count; i++) {
-			int64_t klen = DecodeLong(c);
-			c.Check((idx_t)klen);
-			string key((const char *)c.p, (idx_t)klen);
+		idx_t meta_count = CheckedLength(c, count, "file-metadata block");
+		for (idx_t i = 0; i < meta_count; i++) {
+			idx_t klen = CheckedLength(c, DecodeLong(c), "metadata key");
+			string key((const char *)c.p, klen);
 			c.p += klen;
-			int64_t vlen = DecodeLong(c);
-			c.Check((idx_t)vlen);
-			string val((const char *)c.p, (idx_t)vlen);
+			idx_t vlen = CheckedLength(c, DecodeLong(c), "metadata value");
+			string val((const char *)c.p, vlen);
 			c.p += vlen;
 			if (key == "avro.schema") {
 				schema_json = val;
@@ -236,24 +256,23 @@ PaimonAvroReader::PaimonAvroReader(ClientContext &context, const string &path) {
 	// Data blocks.
 	while (c.p < c.end) {
 		int64_t obj_count = DecodeLong(c);
-		int64_t block_len = DecodeLong(c);
-		c.Check((idx_t)block_len);
+		idx_t block_bytes = CheckedLength(c, DecodeLong(c), "data block");
 		const_data_ptr_t block = c.p;
-		c.p += block_len;
+		c.p += block_bytes;
 
 		string decompressed;
 		const_data_ptr_t data_ptr;
 		idx_t data_len;
 		if (codec == "null") {
 			data_ptr = block;
-			data_len = (idx_t)block_len;
+			data_len = block_bytes;
 		} else { // zstandard — stream-decompress (Avro frames may omit the content size header)
 			auto ds = duckdb_zstd::ZSTD_createDStream();
 			if (!ds) {
 				throw IOException("Failed to create zstd decompression stream");
 			}
 			duckdb_zstd::ZSTD_initDStream(ds);
-			duckdb_zstd::ZSTD_inBuffer in_buf {block, (size_t)block_len, 0};
+			duckdb_zstd::ZSTD_inBuffer in_buf {block, (size_t)block_bytes, 0};
 			vector<char> out_chunk(duckdb_zstd::ZSTD_DStreamOutSize());
 			while (in_buf.pos < in_buf.size) {
 				duckdb_zstd::ZSTD_outBuffer out_buf {out_chunk.data(), out_chunk.size(), 0};
@@ -273,7 +292,10 @@ PaimonAvroReader::PaimonAvroReader(ClientContext &context, const string &path) {
 		}
 
 		ByteCursor bc {data_ptr, data_ptr + data_len};
-		for (int64_t i = 0; i < obj_count; i++) {
+		// A record occupies at least one byte, so a block cannot contain more records than it has
+		// (decompressed) bytes; reject an obj_count that exceeds that to bound the loop on bad input.
+		idx_t records = CheckedLength(bc, obj_count, "data block record count");
+		for (idx_t i = 0; i < records; i++) {
 			auto rec = DecodeRecord(bc, *root_type);
 			auto &children = StructValue::GetChildren(rec);
 			vector<Value> row;

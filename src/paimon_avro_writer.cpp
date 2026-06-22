@@ -150,10 +150,16 @@ void PaimonAvroWriter::WriteFile(ClientContext &context, const string &path, con
 	// Single data block: object count, byte length, encoded records, sync.
 	string block;
 	for (auto &row : rows) {
+		// Every row must supply exactly one value per schema field. Silently padding a short row with
+		// NULLs would write a corrupt manifest to disk, so a mismatch is a hard error (caller bug).
+		if (row.size() != root->fields.size()) {
+			throw IOException("Avro write row has " + std::to_string(row.size()) + " values but the schema has " +
+			                  std::to_string(root->fields.size()) + " fields");
+		}
 		auto rec = Value::STRUCT([&]() {
 			child_list_t<Value> kv;
 			for (idx_t i = 0; i < root->fields.size(); i++) {
-				kv.emplace_back(root->fields[i].first, i < row.size() ? row[i] : Value());
+				kv.emplace_back(root->fields[i].first, row[i]);
 			}
 			return kv;
 		}());

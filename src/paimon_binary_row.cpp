@@ -52,10 +52,12 @@ bool ReadVarBytes(const_data_ptr_t base, idx_t total_size, uint64_t slot, string
 		}
 		return true;
 	}
-	// Otherwise the slot is a packed (offset << 32) | size pointing into the variable part.
+	// Otherwise the slot is a packed (offset << 32) | size pointing into the variable part. offset and
+	// len are each masked to 32 bits; the comparison is written to avoid the offset+len addition (which,
+	// though it can't overflow a 64-bit idx_t here, is fragile) — both must lie within total_size.
 	idx_t offset = (idx_t)(slot >> 32);
 	idx_t len = (idx_t)(slot & 0xFFFFFFFFULL);
-	if (offset + len > total_size) {
+	if (offset > total_size || len > total_size - offset) {
 		return false;
 	}
 	out.assign((const char *)(base + offset), len);
@@ -68,6 +70,8 @@ Value DecodeField(const_data_ptr_t base, idx_t total_size, idx_t null_bits, idx_
 	if (IsNullAt(base, field)) {
 		return Value(logical);
 	}
+	// Precondition (guaranteed by Decode's up-front size check): the field's 8-byte slot is in bounds.
+	D_ASSERT(null_bits + (field + 1) * 8 <= total_size);
 	const_data_ptr_t slot = base + null_bits + field * 8;
 	uint64_t raw = ReadLE64(slot);
 
@@ -104,6 +108,12 @@ Value DecodeField(const_data_ptr_t base, idx_t total_size, idx_t null_bits, idx_
 		// Larger decimals live in the variable part as a big-endian two's-complement integer.
 		string bytes;
 		if (!ReadVarBytes(base, total_size, raw, bytes) || bytes.empty()) {
+			return Value(LogicalType::DECIMAL(width, scale));
+		}
+		// A DECIMAL(38) unscaled value fits in 16 bytes. A longer blob cannot be represented in
+		// hugeint_t and would overflow the accumulation below (signed __int128 overflow is undefined
+		// behaviour), so treat it as malformed and return NULL rather than risk UB.
+		if (bytes.size() > 16) {
 			return Value(LogicalType::DECIMAL(width, scale));
 		}
 		hugeint_t h(0);
@@ -149,6 +159,9 @@ vector<Value> PaimonBinaryRow::Decode(const_data_ptr_t data, idx_t size, const v
 	if (arity == 0) {
 		return result;
 	}
+	// arity comes from the schema (trusted, small); this bound documents that null_bits + arity*8
+	// below cannot overflow idx_t.
+	D_ASSERT(arity <= (1ULL << 28));
 	idx_t null_bits = NullBitsSizeInBytes(arity);
 	if (size < null_bits + arity * 8) {
 		// Malformed / truncated blob — return empty so the caller can fall back.

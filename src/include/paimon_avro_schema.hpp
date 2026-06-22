@@ -77,7 +77,10 @@ struct AvroSchemaParser {
 			throw IOException("Malformed Avro schema node");
 		}
 		auto type_val = yyjson_obj_get(v, "type");
-		string type_str = type_val && yyjson_is_str(type_val) ? yyjson_get_str(type_val) : "";
+		if (!type_val || !yyjson_is_str(type_val)) {
+			throw IOException("Avro schema object missing a string 'type'");
+		}
+		string type_str = yyjson_get_str(type_val);
 		if (type_str == "record") {
 			auto t = make_shared_ptr<AvroType>();
 			t->kind = AvroKind::RECORD;
@@ -92,7 +95,14 @@ struct AvroSchemaParser {
 				yyjson_arr_foreach(fields, idx, max, f) {
 					auto fname = yyjson_obj_get(f, "name");
 					auto ftype = yyjson_obj_get(f, "type");
-					t->fields.emplace_back(fname && yyjson_is_str(fname) ? yyjson_get_str(fname) : "", Parse(ftype));
+					if (!fname || !yyjson_is_str(fname)) {
+						throw IOException("Avro record field missing a string 'name'");
+					}
+					if (!ftype) {
+						throw IOException("Avro record field '" + string(yyjson_get_str(fname)) +
+						                  "' missing 'type'");
+					}
+					t->fields.emplace_back(yyjson_get_str(fname), Parse(ftype));
 				}
 			}
 			return t;
@@ -113,7 +123,11 @@ struct AvroSchemaParser {
 			auto t = make_shared_ptr<AvroType>();
 			t->kind = AvroKind::FIXED;
 			auto sz = yyjson_obj_get(v, "size");
-			t->fixed_size = sz && yyjson_is_int(sz) ? (idx_t)yyjson_get_int(sz) : 0;
+			int64_t fixed = sz && yyjson_is_int(sz) ? yyjson_get_int(sz) : 0;
+			if (fixed < 0) {
+				throw IOException("Avro fixed type has negative size");
+			}
+			t->fixed_size = (idx_t)fixed;
 			auto name_val = yyjson_obj_get(v, "name");
 			if (name_val && yyjson_is_str(name_val)) {
 				named[yyjson_get_str(name_val)] = t;
