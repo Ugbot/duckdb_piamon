@@ -77,6 +77,57 @@ Value DecodeRecord(ByteCursor &c, const AvroType &type) {
 	return Value::STRUCT(std::move(children));
 }
 
+// Avro arrays/maps are a sequence of blocks terminated by a zero count. Each block-count read consumes
+// at least one byte and CheckedLength bounds the count by the bytes left, so the loop is bounded by the
+// buffer size and cannot spin or over-allocate on malformed input. A negative count is the "count then
+// block-byte-size" form; the byte size is read and ignored.
+Value DecodeArray(ByteCursor &c, const AvroType &type) {
+	vector<Value> items;
+	while (true) {
+		int64_t count = DecodeLong(c);
+		if (count == 0) {
+			break;
+		}
+		if (count < 0) {
+			count = -count;
+			DecodeLong(c);
+		}
+		idx_t n = CheckedLength(c, count, "array block");
+		for (idx_t i = 0; i < n; i++) {
+			items.push_back(DecodeValue(c, *type.items));
+		}
+	}
+	auto child_type = items.empty() ? LogicalType::VARCHAR : items[0].type();
+	return Value::LIST(child_type, std::move(items));
+}
+
+// Decoded as a LIST of STRUCT(key, value) — not used by the manifest parsers, but consumed correctly.
+Value DecodeMap(ByteCursor &c, const AvroType &type) {
+	vector<Value> entries;
+	while (true) {
+		int64_t count = DecodeLong(c);
+		if (count == 0) {
+			break;
+		}
+		if (count < 0) {
+			count = -count;
+			DecodeLong(c);
+		}
+		idx_t n = CheckedLength(c, count, "map block");
+		for (idx_t i = 0; i < n; i++) {
+			idx_t klen = CheckedLength(c, DecodeLong(c), "map key");
+			string key((const char *)c.p, klen);
+			c.p += klen;
+			child_list_t<Value> kv;
+			kv.emplace_back("key", Value(key));
+			kv.emplace_back("value", DecodeValue(c, *type.items));
+			entries.push_back(Value::STRUCT(std::move(kv)));
+		}
+	}
+	auto child_type = entries.empty() ? LogicalType::VARCHAR : entries[0].type();
+	return Value::LIST(child_type, std::move(entries));
+}
+
 Value DecodeValue(ByteCursor &c, const AvroType &type) {
 	switch (type.kind) {
 	case AvroKind::NUL:
@@ -132,55 +183,10 @@ Value DecodeValue(ByteCursor &c, const AvroType &type) {
 		}
 		return DecodeValue(c, *type.branches[branch]);
 	}
-	case AvroKind::ARRAY: {
-		// Avro arrays are a sequence of blocks terminated by a zero count. Each block-count read
-		// consumes at least one byte and CheckedLength bounds the count by the bytes left, so the
-		// loop is bounded by the buffer size and cannot spin or over-allocate on malformed input.
-		vector<Value> items;
-		while (true) {
-			int64_t count = DecodeLong(c);
-			if (count == 0) {
-				break;
-			}
-			if (count < 0) {
-				count = -count;
-				DecodeLong(c); // block byte size (ignored)
-			}
-			idx_t n = CheckedLength(c, count, "array block");
-			for (idx_t i = 0; i < n; i++) {
-				items.push_back(DecodeValue(c, *type.items));
-			}
-		}
-		auto child_type = items.empty() ? LogicalType::VARCHAR : items[0].type();
-		return Value::LIST(child_type, std::move(items));
-	}
-	case AvroKind::MAP: {
-		// Decode into a LIST of STRUCT(key,value) — not used by the manifest parsers, but consumed.
-		// Bounded for the same reason as ARRAY above.
-		vector<Value> entries;
-		while (true) {
-			int64_t count = DecodeLong(c);
-			if (count == 0) {
-				break;
-			}
-			if (count < 0) {
-				count = -count;
-				DecodeLong(c);
-			}
-			idx_t n = CheckedLength(c, count, "map block");
-			for (idx_t i = 0; i < n; i++) {
-				idx_t klen = CheckedLength(c, DecodeLong(c), "map key");
-				string key((const char *)c.p, klen);
-				c.p += klen;
-				child_list_t<Value> kv;
-				kv.emplace_back("key", Value(key));
-				kv.emplace_back("value", DecodeValue(c, *type.items));
-				entries.push_back(Value::STRUCT(std::move(kv)));
-			}
-		}
-		auto child_type = entries.empty() ? LogicalType::VARCHAR : entries[0].type();
-		return Value::LIST(child_type, std::move(entries));
-	}
+	case AvroKind::ARRAY:
+		return DecodeArray(c, type);
+	case AvroKind::MAP:
+		return DecodeMap(c, type);
 	default:
 		throw IOException("Unhandled Avro kind");
 	}

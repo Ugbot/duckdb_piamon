@@ -1557,31 +1557,73 @@ static void CollectReferencedFiles(ClientContext &context, const string &table_p
 	}
 }
 
+// Sorted list of snapshot ids present on disk under <table>/snapshot.
+static vector<int64_t> EnumerateSnapshotIds(FileSystem &fs, const string &snapshot_dir) {
+	vector<int64_t> ids;
+	if (fs.DirectoryExists(snapshot_dir)) {
+		fs.ListFiles(snapshot_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::StartsWith(fname, "snapshot-")) {
+				try {
+					ids.push_back(std::stoll(fname.substr(9)));
+				} catch (...) {
+				}
+			}
+		});
+	}
+	std::sort(ids.begin(), ids.end());
+	return ids;
+}
+
+// The files referenced by the retained snapshots and all tags ("live") versus by every snapshot
+// ("all"). The set difference (all - live) is exactly what expiration may delete.
+struct ReferencedFileSets {
+	std::unordered_set<string> live_lists, live_manifests, live_data;
+	std::unordered_set<string> all_lists, all_manifests, all_data;
+};
+
+static ReferencedFileSets CollectReferencedFileSets(ClientContext &context, const string &table_path, FileSystem &fs,
+                                                    const PaimonSchema *schema, const vector<int64_t> &snapshot_ids,
+                                                    int64_t earliest_retained) {
+	ReferencedFileSets sets;
+	string snapshot_dir = table_path + "/snapshot";
+	for (int64_t id : snapshot_ids) {
+		string sp = snapshot_dir + "/snapshot-" + std::to_string(id);
+		if (!fs.FileExists(sp)) {
+			continue;
+		}
+		string json = IcebergUtils::FileToString(sp, fs);
+		CollectReferencedFiles(context, table_path, json, schema, sets.all_lists, sets.all_manifests, sets.all_data);
+		if (id >= earliest_retained) {
+			CollectReferencedFiles(context, table_path, json, schema, sets.live_lists, sets.live_manifests,
+			                       sets.live_data);
+		}
+	}
+	// Tagged snapshots pin their data: treat every tag's referenced files as live.
+	string tag_dir = table_path + "/tag";
+	if (fs.DirectoryExists(tag_dir)) {
+		fs.ListFiles(tag_dir, [&](const string &fname, bool is_dir) {
+			if (!is_dir && StringUtil::StartsWith(fname, "tag-")) {
+				string json = IcebergUtils::FileToString(tag_dir + "/" + fname, fs);
+				CollectReferencedFiles(context, table_path, json, schema, sets.live_lists, sets.live_manifests,
+				                       sets.live_data);
+			}
+		});
+	}
+	return sets;
+}
+
 static unique_ptr<GlobalTableFunctionState> PaimonExpireInit(ClientContext &context,
                                                              TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PaimonExpireBindData>();
 	auto state = make_uniq<PaimonExpireGlobalState>();
 	FileSystem &fs = FileSystem::GetFileSystem(context);
 	const string &table_path = bind_data.table_path;
-
-	// Enumerate snapshot ids on disk.
-	vector<int64_t> snapshot_ids;
 	string snapshot_dir = table_path + "/snapshot";
-	if (fs.DirectoryExists(snapshot_dir)) {
-		fs.ListFiles(snapshot_dir, [&](const string &fname, bool is_dir) {
-			if (!is_dir && StringUtil::StartsWith(fname, "snapshot-")) {
-				try {
-					snapshot_ids.push_back(std::stoll(fname.substr(9)));
-				} catch (...) {
-				}
-			}
-		});
-	}
-	std::sort(snapshot_ids.begin(), snapshot_ids.end());
+
+	vector<int64_t> snapshot_ids = EnumerateSnapshotIds(fs, snapshot_dir);
 	if ((int64_t)snapshot_ids.size() <= bind_data.retain_max) {
 		return std::move(state); // nothing to expire
 	}
-
 	// Keep the newest retain_max snapshots; the rest expire.
 	int64_t earliest_retained = snapshot_ids[snapshot_ids.size() - bind_data.retain_max];
 
@@ -1595,33 +1637,7 @@ static unique_ptr<GlobalTableFunctionState> PaimonExpireInit(ClientContext &cont
 	} catch (...) {
 	}
 
-	// Files referenced by the snapshots/tags we keep ("live") vs. by every snapshot ("all"). The
-	// difference is exactly what expiration orphans and may delete.
-	std::unordered_set<string> live_lists, live_manifests, live_data;
-	std::unordered_set<string> all_lists, all_manifests, all_data;
-
-	for (int64_t id : snapshot_ids) {
-		string sp = snapshot_dir + "/snapshot-" + std::to_string(id);
-		if (!fs.FileExists(sp)) {
-			continue;
-		}
-		string json = IcebergUtils::FileToString(sp, fs);
-		CollectReferencedFiles(context, table_path, json, schema, all_lists, all_manifests, all_data);
-		if (id >= earliest_retained) {
-			CollectReferencedFiles(context, table_path, json, schema, live_lists, live_manifests, live_data);
-		}
-	}
-
-	// Tagged snapshots pin their data: treat every tag's referenced files as live.
-	string tag_dir = table_path + "/tag";
-	if (fs.DirectoryExists(tag_dir)) {
-		fs.ListFiles(tag_dir, [&](const string &fname, bool is_dir) {
-			if (!is_dir && StringUtil::StartsWith(fname, "tag-")) {
-				string json = IcebergUtils::FileToString(tag_dir + "/" + fname, fs);
-				CollectReferencedFiles(context, table_path, json, schema, live_lists, live_manifests, live_data);
-			}
-		});
-	}
+	ReferencedFileSets sets = CollectReferencedFileSets(context, table_path, fs, schema, snapshot_ids, earliest_retained);
 
 	// Delete orphaned files (referenced only by expired snapshots), then the expired snapshot files.
 	auto delete_orphans = [&](const std::unordered_set<string> &all, const std::unordered_set<string> &live) {
@@ -1632,9 +1648,9 @@ static unique_ptr<GlobalTableFunctionState> PaimonExpireInit(ClientContext &cont
 			}
 		}
 	};
-	delete_orphans(all_data, live_data);
-	delete_orphans(all_manifests, live_manifests);
-	delete_orphans(all_lists, live_lists);
+	delete_orphans(sets.all_data, sets.live_data);
+	delete_orphans(sets.all_manifests, sets.live_manifests);
+	delete_orphans(sets.all_lists, sets.live_lists);
 
 	for (int64_t id : snapshot_ids) {
 		if (id < earliest_retained) {
