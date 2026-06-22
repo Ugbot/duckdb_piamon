@@ -309,7 +309,12 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 			id_to_pos[latest.fields[i].id] = i;
 		}
 		FileSystem &fs2 = FileSystem::GetFileSystem(context);
-		for (int64_t sid = latest.id - 1; sid >= 0; sid--) {
+		// Walk older schemas newest-first to recover renamed columns' historical names. Bounded by
+		// latest.id, but cap the scan as a backstop against a corrupt/oversized schema id; missing a
+		// very old name only makes that column read NULL for those files (graceful, not wrong).
+		static constexpr int64_t MAX_SCHEMA_HISTORY = 4096;
+		int64_t scanned = 0;
+		for (int64_t sid = latest.id - 1; sid >= 0 && scanned < MAX_SCHEMA_HISTORY; sid--, scanned++) {
 			try {
 				auto old_schema = PaimonTableMetadata::LoadSchema(table_path, sid, fs2);
 				if (!old_schema) {
@@ -460,7 +465,14 @@ static const char *ComparisonOpSql(ExpressionType type) {
 // Over-approximation is therefore safe for AND (drop untranslatable conjuncts → wider result), but an
 // OR must be abandoned entirely if any branch is untranslatable (a partial OR would wrongly drop rows).
 static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
-                                  const case_insensitive_set_t &valid_names) {
+                                  const case_insensitive_set_t &valid_names, idx_t depth = 0) {
+	// Bound the recursion: a deeply nested predicate must not overflow the stack. Past the limit we
+	// give up translating (return ""), which only forgoes pruning — the full filter is still applied
+	// above the scan, so correctness is unaffected.
+	static constexpr idx_t MAX_FILTER_DEPTH = 64;
+	if (depth >= MAX_FILTER_DEPTH) {
+		return "";
+	}
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &col = expr.Cast<BoundColumnRefExpression>();
@@ -495,8 +507,8 @@ static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
 		if (!op) {
 			return "";
 		}
-		string l = TranslateFilterExpr(*cmp.left, get, valid_names);
-		string r = TranslateFilterExpr(*cmp.right, get, valid_names);
+		string l = TranslateFilterExpr(*cmp.left, get, valid_names, depth + 1);
+		string r = TranslateFilterExpr(*cmp.right, get, valid_names, depth + 1);
 		if (l.empty() || r.empty()) {
 			return "";
 		}
@@ -508,7 +520,7 @@ static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
 			if (op.children.size() != 1) {
 				return "";
 			}
-			string c = TranslateFilterExpr(*op.children[0], get, valid_names);
+			string c = TranslateFilterExpr(*op.children[0], get, valid_names, depth + 1);
 			if (c.empty()) {
 				return "";
 			}
@@ -518,7 +530,7 @@ static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
 			if (op.children.size() < 2) {
 				return "";
 			}
-			string col = TranslateFilterExpr(*op.children[0], get, valid_names);
+			string col = TranslateFilterExpr(*op.children[0], get, valid_names, depth + 1);
 			if (col.empty()) {
 				return "";
 			}
@@ -542,7 +554,7 @@ static string TranslateFilterExpr(const Expression &expr, const LogicalGet &get,
 		bool is_and = (expr.type == ExpressionType::CONJUNCTION_AND);
 		vector<string> parts;
 		for (auto &child : conj.children) {
-			string c = TranslateFilterExpr(*child, get, valid_names);
+			string c = TranslateFilterExpr(*child, get, valid_names, depth + 1);
 			if (c.empty()) {
 				if (is_and) {
 					continue; // dropping an AND conjunct only widens the result — safe

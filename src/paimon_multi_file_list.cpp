@@ -119,11 +119,19 @@ void PaimonMultiFileList::DiscoverDataFiles() {
 }
 
 void PaimonMultiFileList::DiscoverFilesFromBucketDirs(const string &base_dir, FileSystem &fs) {
-	// BFS to find all bucket directories and their data files
+	// BFS to find all bucket directories and their data files. Paimon partition nesting is one level
+	// per partition key (a handful at most), so an enormous frontier means a pathological or hostile
+	// directory tree — cap the work to keep discovery bounded rather than walk forever.
+	static constexpr idx_t MAX_DIRS_VISITED = 1u << 20; // ~1M directories
+	idx_t dirs_visited = 0;
 	vector<string> dirs_to_search;
 	dirs_to_search.push_back(base_dir);
 
 	while (!dirs_to_search.empty()) {
+		if (++dirs_visited > MAX_DIRS_VISITED) {
+			throw IOException("Paimon file discovery exceeded " + std::to_string(MAX_DIRS_VISITED) +
+			                  " directories under " + base_dir + " (malformed or unbounded partition tree)");
+		}
 		string current_dir = dirs_to_search.back();
 		dirs_to_search.pop_back();
 
