@@ -223,14 +223,10 @@ static string AggExpr(const string &col, const string &fn, const string &order_v
 	return "arg_max(" + q + ", " + order_val + ") FILTER (WHERE " + q + " IS NOT NULL)";
 }
 
-static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<PaimonScanBindData>();
-	string table_path = input.inputs[0].ToString();
-
-	// Parse snapshot-selection named parameters for time travel.
+// Parse paimon_scan's named parameters (time travel + incremental selection) into PaimonOptions.
+static PaimonOptions ParseScanOptions(const named_parameter_map_t &params) {
 	PaimonOptions options;
-	for (auto &kv : input.named_parameters) {
+	for (auto &kv : params) {
 		auto key = StringUtil::Lower(kv.first);
 		if (key == "version") {
 			options.table_version = StringValue::Get(kv.second);
@@ -250,6 +246,136 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 		}
 	}
 	// incremental_to without incremental_from means "everything up to and including N" (from = 0).
+	return options;
+}
+
+// Map each latest column name to its history of names (latest first), so a column that was renamed
+// across schema evolution can be COALESCE'd over its old names. Paimon field ids are stable, so we
+// match older schemas by field id. See BuildProjection for how the history is consumed.
+static case_insensitive_map_t<vector<string>> BuildFieldHistory(const string &table_path,
+                                                                const PaimonSchema &latest, FileSystem &fs) {
+	case_insensitive_map_t<vector<string>> field_history; // latest name -> [latest, ...older names]
+	unordered_map<int, idx_t> id_to_pos;                  // field id -> index into latest.fields
+	for (idx_t i = 0; i < latest.fields.size(); i++) {
+		field_history[latest.fields[i].name] = {latest.fields[i].name};
+		id_to_pos[latest.fields[i].id] = i;
+	}
+	// Walk older schemas newest-first. Bounded by latest.id, but cap the scan as a backstop against a
+	// corrupt/oversized id; missing a very old name only makes that column read NULL for those files.
+	static constexpr int64_t MAX_SCHEMA_HISTORY = 4096;
+	int64_t scanned = 0;
+	for (int64_t sid = latest.id - 1; sid >= 0 && scanned < MAX_SCHEMA_HISTORY; sid--, scanned++) {
+		try {
+			auto old_schema = PaimonTableMetadata::LoadSchema(table_path, sid, fs);
+			if (!old_schema) {
+				continue;
+			}
+			for (auto &of : old_schema->fields) {
+				auto it = id_to_pos.find(of.id);
+				if (it == id_to_pos.end()) {
+					continue; // field dropped before the latest schema
+				}
+				auto &hist = field_history[latest.fields[it->second].name];
+				if (std::find(hist.begin(), hist.end(), of.name) == hist.end()) {
+					hist.push_back(of.name);
+				}
+			}
+		} catch (const std::exception &e) {
+			// Missing/unreadable older schema — skip.
+		}
+	}
+	return field_history;
+}
+
+// Build the SELECT projection: each latest column cast to its declared type, sourced via COALESCE over
+// its historical names when it was renamed (so older files still resolve the value).
+static string BuildProjection(const vector<string> &names, const vector<LogicalType> &return_types,
+                              const case_insensitive_map_t<vector<string>> &field_history) {
+	D_ASSERT(names.size() == return_types.size());
+	string projection;
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (i > 0) {
+			projection += ", ";
+		}
+		const string &col = names[i];
+		string source_expr = QuoteIdentifier(col);
+		auto hist = field_history.find(col);
+		if (hist != field_history.end() && hist->second.size() > 1) {
+			source_expr = "COALESCE(";
+			for (idx_t h = 0; h < hist->second.size(); h++) {
+				source_expr += (h ? ", " : "") + QuoteIdentifier(hist->second[h]);
+			}
+			source_expr += ")";
+		}
+		projection += "CAST(" + source_expr + " AS " + return_types[i].ToString() + ") AS " + QuoteIdentifier(col);
+	}
+	return projection;
+}
+
+// Build the merge-on-read SQL for a primary-key table according to its merge-engine. Each PK data file
+// carries _SEQUENCE_NUMBER / _VALUE_KIND; `base` casts/renames the columns to the latest schema and
+// exposes those as _pseq / _pvk, then the engine collapses rows per key.
+static string BuildMergeOnReadSql(const string &merge_engine, const string &projection, const string &file_array,
+                                  const vector<string> &primary_keys, const vector<string> &seq_fields,
+                                  const vector<string> &names, const vector<LogicalType> &return_types,
+                                  const case_insensitive_map_t<string> &options) {
+	string pk_cols;
+	for (idx_t i = 0; i < primary_keys.size(); i++) {
+		pk_cols += (i ? ", " : "") + QuoteIdentifier(primary_keys[i]);
+	}
+	string base = "SELECT " + projection + ", \"_SEQUENCE_NUMBER\" AS _pseq, \"_VALUE_KIND\" AS _pvk FROM " +
+	              file_array;
+	// base already casts/renames to the latest schema, so downstream selects reference final names.
+	string name_list;
+	for (idx_t i = 0; i < names.size(); i++) {
+		name_list += (i ? ", " : "") + QuoteIdentifier(names[i]);
+	}
+
+	if (merge_engine == "partial-update" || merge_engine == "aggregation") {
+		// Collapse each key to one row: partial-update keeps the latest non-null value per column;
+		// aggregation applies each column's configured function. Delete records (_pvk=3) are excluded.
+		bool is_agg = (merge_engine == "aggregation");
+		string order_val = SeqOrderValue(seq_fields);
+		case_insensitive_set_t pk_set(primary_keys.begin(), primary_keys.end());
+		string select_list;
+		for (idx_t i = 0; i < names.size(); i++) {
+			const string &col = names[i];
+			select_list += (i ? ", " : "");
+			if (pk_set.find(col) != pk_set.end()) {
+				select_list += QuoteIdentifier(col);
+				continue;
+			}
+			string expr;
+			if (is_agg) {
+				string fn;
+				auto fit = options.find("fields." + col + ".aggregate-function");
+				if (fit != options.end()) {
+					fn = StringUtil::Lower(fit->second);
+				}
+				expr = AggExpr(col, fn, order_val);
+			} else {
+				expr = "arg_max(" + QuoteIdentifier(col) + ", " + order_val + ") FILTER (WHERE " +
+				       QuoteIdentifier(col) + " IS NOT NULL)";
+			}
+			// Aggregates can widen the type (sum(BIGINT)->HUGEINT); cast back to the declared type.
+			select_list += "CAST(" + expr + " AS " + return_types[i].ToString() + ") AS " + QuoteIdentifier(col);
+		}
+		return "SELECT " + select_list + " FROM (" + base + ") WHERE _pvk <> 3 GROUP BY " + pk_cols;
+	}
+
+	// first-row keeps the lowest-sequence row per key; deduplicate (default) keeps the highest.
+	const char *dir = (merge_engine == "first-row") ? "ASC" : "DESC";
+	string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols + " ORDER BY " +
+	               SeqOrderClause(seq_fields, dir) + ") AS _paimon_rn FROM (" + base + ")";
+	return "SELECT " + name_list + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND _pvk IN " + string(VALUE_KIND_KEEP);
+}
+
+static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<PaimonScanBindData>();
+	string table_path = input.inputs[0].ToString();
+
+	PaimonOptions options = ParseScanOptions(input.named_parameters);
 
 	// Discover the active data files + load the schema (manifest-driven, with directory fallback).
 	PaimonMultiFileList file_list(context, table_path, options);
@@ -299,144 +425,28 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	return_types = result->return_types;
 	names = result->names;
 
-	// Field-id mapping across schema evolution: a column read from an older data file may have been
-	// renamed, so we COALESCE over all historical names of each latest field id (latest name first).
-	// Paimon field ids are stable; this matches the Spark/Flink readers (a renamed column keeps its
-	// old data, unlike a name-only match). pk columns are immutable so this only affects values.
-	case_insensitive_map_t<vector<string>> field_history; // latest column name -> [latest, ...older names]
+	// Field-id mapping across schema evolution: a renamed column keeps its data under stable field ids,
+	// so the projection COALESCEs each latest column over its historical names (see BuildProjection).
+	case_insensitive_map_t<vector<string>> field_history;
 	if (file_list.metadata && file_list.metadata->schema && file_list.metadata->schema->id > 0) {
-		auto &latest = *file_list.metadata->schema;
-		unordered_map<int, idx_t> id_to_pos; // field id -> index into result->names
-		for (idx_t i = 0; i < latest.fields.size(); i++) {
-			field_history[latest.fields[i].name] = {latest.fields[i].name};
-			id_to_pos[latest.fields[i].id] = i;
-		}
 		FileSystem &fs2 = FileSystem::GetFileSystem(context);
-		// Walk older schemas newest-first to recover renamed columns' historical names. Bounded by
-		// latest.id, but cap the scan as a backstop against a corrupt/oversized schema id; missing a
-		// very old name only makes that column read NULL for those files (graceful, not wrong).
-		static constexpr int64_t MAX_SCHEMA_HISTORY = 4096;
-		int64_t scanned = 0;
-		for (int64_t sid = latest.id - 1; sid >= 0 && scanned < MAX_SCHEMA_HISTORY; sid--, scanned++) {
-			try {
-				auto old_schema = PaimonTableMetadata::LoadSchema(table_path, sid, fs2);
-				if (!old_schema) {
-					continue;
-				}
-				for (auto &of : old_schema->fields) {
-					auto it = id_to_pos.find(of.id);
-					if (it == id_to_pos.end()) {
-						continue; // field dropped before the latest schema
-					}
-					auto &hist = field_history[latest.fields[it->second].name];
-					if (std::find(hist.begin(), hist.end(), of.name) == hist.end()) {
-						hist.push_back(of.name);
-					}
-				}
-			} catch (const std::exception &e) {
-				// Missing/unreadable older schema — skip.
-			}
-		}
+		field_history = BuildFieldHistory(table_path, *file_list.metadata->schema, fs2);
 	}
-
-	// Build the projection list (cast each column to its Paimon logical type so the query result
-	// types match the declared schema exactly).
-	string projection;
-	for (idx_t i = 0; i < result->names.size(); i++) {
-		if (i > 0) {
-			projection += ", ";
-		}
-		const string &col = result->names[i];
-		string source_expr = QuoteIdentifier(col);
-		auto hist = field_history.find(col);
-		if (hist != field_history.end() && hist->second.size() > 1) {
-			source_expr = "COALESCE(";
-			for (idx_t h = 0; h < hist->second.size(); h++) {
-				source_expr += (h ? ", " : "") + QuoteIdentifier(hist->second[h]);
-			}
-			source_expr += ")";
-		}
-		projection += "CAST(" + source_expr + " AS " + result->return_types[i].ToString() + ") AS " +
-		              QuoteIdentifier(col);
-	}
+	string projection = BuildProjection(result->names, result->return_types, field_history);
 
 	if (file_list.files.empty()) {
 		result->sql.clear(); // execute will return zero rows
 		return std::move(result);
 	}
 
-	// Table source over the resolved active files, dispatched by file format (parquet/avro; ORC errors
-	// out). union_by_name (parquet) handles schema evolution — files written under an older schema are
-	// matched by column name and missing columns surface as NULL — and the outer projection then
-	// selects the latest schema's columns in order.
+	// Table source over the resolved active files, dispatched by file format (parquet/avro; ORC errors).
 	string file_array = BuildDataFileSource(file_list.files);
 
 	if (!is_pk) {
 		result->sql = "SELECT " + projection + " FROM " + file_array;
 	} else {
-		// Merge-on-read. Each PK data file carries _SEQUENCE_NUMBER and _VALUE_KIND. We first cast/
-		// rename columns to the latest schema (`projection`) and expose the sequence + kind as _pseq /
-		// _pvk, then apply the table's configured merge engine per primary key.
-		string pk_cols;
-		for (idx_t i = 0; i < primary_keys.size(); i++) {
-			pk_cols += (i ? ", " : "") + QuoteIdentifier(primary_keys[i]);
-		}
-		string base = "SELECT " + projection + ", \"_SEQUENCE_NUMBER\" AS _pseq, \"_VALUE_KIND\" AS _pvk FROM " +
-		              file_array;
-		// `base` already casts/renames to the latest schema, so downstream selects reference the final
-		// column names directly (not the COALESCE projection, whose source columns no longer exist).
-		string name_list;
-		for (idx_t i = 0; i < result->names.size(); i++) {
-			name_list += (i ? ", " : "") + QuoteIdentifier(result->names[i]);
-		}
-
-		if (merge_engine == "first-row") {
-			// Keep the FIRST row per key (lowest sequence); later rows for the key are ignored.
-			string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols + " ORDER BY " +
-			               SeqOrderClause(seq_fields, "ASC") + ") AS _paimon_rn FROM (" + base + ")";
-			result->sql = "SELECT " + name_list + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND _pvk IN " +
-			              string(VALUE_KIND_KEEP);
-		} else if (merge_engine == "partial-update" || merge_engine == "aggregation") {
-			// Collapse each key to one row: partial-update takes the latest non-null value per column;
-			// aggregation applies each column's configured aggregate function. Delete records (_pvk=3)
-			// are excluded (retraction/sequence-group semantics are not modelled here).
-			bool is_agg = (merge_engine == "aggregation");
-			string order_val = SeqOrderValue(seq_fields);
-			auto &opts = file_list.metadata->schema->options;
-			case_insensitive_set_t pk_set(primary_keys.begin(), primary_keys.end());
-			string select_list;
-			for (idx_t i = 0; i < result->names.size(); i++) {
-				const string &col = result->names[i];
-				select_list += (i ? ", " : "");
-				if (pk_set.find(col) != pk_set.end()) {
-					select_list += QuoteIdentifier(col);
-					continue;
-				}
-				string expr;
-				if (is_agg) {
-					string fn;
-					auto fit = opts.find("fields." + col + ".aggregate-function");
-					if (fit != opts.end()) {
-						fn = StringUtil::Lower(fit->second);
-					}
-					expr = AggExpr(col, fn, order_val);
-				} else {
-					expr = "arg_max(" + QuoteIdentifier(col) + ", " + order_val + ") FILTER (WHERE " +
-					       QuoteIdentifier(col) + " IS NOT NULL)";
-				}
-				// Aggregates can widen the type (e.g. sum(BIGINT)->HUGEINT); cast back to the declared
-				// schema type so the result columns match the table's logical types exactly.
-				select_list += "CAST(" + expr + " AS " + result->return_types[i].ToString() + ") AS " +
-				               QuoteIdentifier(col);
-			}
-			result->sql = "SELECT " + select_list + " FROM (" + base + ") WHERE _pvk <> 3 GROUP BY " + pk_cols;
-		} else {
-			// deduplicate (default): keep the highest-sequence row per key, dropping tombstones.
-			string inner = "SELECT *, row_number() OVER (PARTITION BY " + pk_cols + " ORDER BY " +
-			               SeqOrderClause(seq_fields, "DESC") + ") AS _paimon_rn FROM (" + base + ")";
-			result->sql = "SELECT " + name_list + " FROM (" + inner + ") WHERE _paimon_rn = 1 AND _pvk IN " +
-			              string(VALUE_KIND_KEEP);
-		}
+		result->sql = BuildMergeOnReadSql(merge_engine, projection, file_array, primary_keys, seq_fields,
+		                                  result->names, result->return_types, file_list.metadata->schema->options);
 	}
 
 	return std::move(result);
