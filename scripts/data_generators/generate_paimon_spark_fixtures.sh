@@ -28,6 +28,30 @@ UPDATE paimon.default.pk_dynbucket SET v='Y2' WHERE id=2;
 CREATE TABLE paimon.default.appt_fileindex (id INT, name STRING)
   TBLPROPERTIES ('bucket'='-1', 'file-index.bloom-filter.columns'='name');
 INSERT INTO paimon.default.appt_fileindex VALUES (1,'alice'),(2,'bob'),(3,'carol');
+
+-- Merge engines: the reference oracle for these (pypaimon's reader does not implement them).
+CREATE TABLE paimon.default.pk_partial (id INT, a INT, b STRING)
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'merge-engine'='partial-update');
+INSERT INTO paimon.default.pk_partial VALUES (1,10,'x1'),(2,20,CAST(NULL AS STRING)),(3,30,'x3');
+INSERT INTO paimon.default.pk_partial VALUES (1,CAST(NULL AS INT),'y1'),(2,CAST(NULL AS INT),'y2'),(3,99,CAST(NULL AS STRING));
+
+CREATE TABLE paimon.default.pk_agg (id INT, s INT, m INT)
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'merge-engine'='aggregation',
+                 'fields.s.aggregate-function'='sum', 'fields.m.aggregate-function'='max');
+INSERT INTO paimon.default.pk_agg VALUES (1,10,10),(2,5,5);
+INSERT INTO paimon.default.pk_agg VALUES (1,3,99),(2,7,1);
+INSERT INTO paimon.default.pk_agg VALUES (1,2,50);
+
+CREATE TABLE paimon.default.pk_firstrow (id INT, v STRING)
+  TBLPROPERTIES ('primary-key'='id', 'bucket'='1', 'merge-engine'='first-row',
+                 'changelog-producer'='lookup');
+INSERT INTO paimon.default.pk_firstrow VALUES (1,'first1'),(2,'first2'),(3,'first3');
+INSERT INTO paimon.default.pk_firstrow VALUES (1,'second1'),(2,'second2');
+
+-- Print Spark's own reads as the cross-check oracle (markers parsed by the caller).
+SELECT '@@PARTIAL', id, a, b FROM paimon.default.pk_partial ORDER BY id;
+SELECT '@@AGG', id, s, m FROM paimon.default.pk_agg ORDER BY id;
+SELECT '@@FIRSTROW', id, v FROM paimon.default.pk_firstrow ORDER BY id;
 EOSQL
 
 podman run --rm \

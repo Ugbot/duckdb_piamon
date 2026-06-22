@@ -78,3 +78,29 @@ query T
 SELECT name FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/appt_fileindex') WHERE name = 'bob';
 ----
 bob
+
+# --- Merge engines, cross-checked against Spark's own reads (the reference oracle; pypaimon's reader
+# does not implement these). Fixtures + Spark's expected values come from the same Spark run. ---
+
+# partial-update: later non-null values overwrite per column; nulls do not clobber.
+query IIT
+SELECT id, a, b FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_partial') ORDER BY id;
+----
+1	10	y1
+2	20	y2
+3	99	x3
+
+# aggregation: per-column sum / max across all records of a key.
+query III
+SELECT id, s, m FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_agg') ORDER BY id;
+----
+1	15	99
+2	12	5
+
+# first-row: the first record per key wins; later records are ignored.
+query IT
+SELECT id, v FROM paimon_scan('__WORKING_DIRECTORY__/data/generated/paimon_spark/default.db/pk_firstrow') ORDER BY id;
+----
+1	first1
+2	first2
+3	first3
