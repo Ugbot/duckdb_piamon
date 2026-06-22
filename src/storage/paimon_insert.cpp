@@ -514,7 +514,7 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 
 	// Step 3: base manifest list (carry-forward) + the next snapshot id.
 	int64_t next_snapshot_id = ResolveNextSnapshotId(fs, table_path);
-	int64_t prev_snapshot_id = next_snapshot_id - 1;
+	D_ASSERT(next_snapshot_id >= 1);
 	string base_list_path = WriteBaseManifestList(context, fs, path_factory, manifest_list_uuid, table_path,
 	                                               manifest_dir, next_snapshot_id, carry_forward);
 
@@ -528,7 +528,6 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 
 	// The snapshot file is the atomic commit point: FILE_CREATE_NEW fails if another writer already
 	// committed this id, so two concurrent commits can't clobber each other.
-	D_ASSERT(next_snapshot_id > prev_snapshot_id);
 	string snapshot_path = path_factory.snapshotFilePath(next_snapshot_id);
 	{
 		auto handle = fs.OpenFile(snapshot_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
