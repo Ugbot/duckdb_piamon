@@ -208,7 +208,10 @@ SinkFinalizeType PaimonUpdate::Finalize(Pipeline &pipeline, Event &event, Client
 	wf.file_path = data_file;
 	wf.row_count = (int64_t)gstate.update_count;
 	wf.bucket = 0;
-	if (fs.FileExists(data_file)) {
+	if (!fs.FileExists(data_file)) {
+		throw IOException("Paimon UPDATE: data file missing after COPY: " + data_file);
+	}
+	{
 		auto h = fs.OpenFile(data_file, FileFlags::FILE_FLAGS_READ);
 		wf.file_size = h->GetFileSize();
 	}

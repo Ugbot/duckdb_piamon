@@ -292,7 +292,12 @@ void PaimonInsert::CommitPrimaryKeyRows(ClientContext &context, const string &ta
 	wf.file_path = data_file;
 	wf.row_count = (int64_t)rows.Count();
 	wf.bucket = 0;
-	if (fs.FileExists(data_file)) {
+	// The COPY reported success, so the data file must exist; a missing file here would commit a
+	// manifest entry pointing at lost data.
+	if (!fs.FileExists(data_file)) {
+		throw IOException("Paimon PK write: data file missing after COPY: " + data_file);
+	}
+	{
 		auto h = fs.OpenFile(data_file, FileFlags::FILE_FLAGS_READ);
 		wf.file_size = h->GetFileSize();
 	}
@@ -370,11 +375,18 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		PaimonAvroWriter::WriteFile(context, manifest_file_path, ManifestEntrySchemaJson(), entry_rows);
 	}
 
-	// Get actual manifest file size
+	// The manifest must be on disk and non-empty before anything references it; a silent write failure
+	// here would otherwise produce a snapshot pointing at a missing/empty manifest.
+	if (!fs.FileExists(manifest_file_path)) {
+		throw IOException("Paimon commit: manifest file was not written: " + manifest_file_path);
+	}
 	int64_t manifest_file_size = 0;
-	if (fs.FileExists(manifest_file_path)) {
+	{
 		auto handle = fs.OpenFile(manifest_file_path, FileFlags::FILE_FLAGS_READ);
 		manifest_file_size = handle->GetFileSize();
+	}
+	if (manifest_file_size == 0) {
+		throw IOException("Paimon commit: manifest file is empty: " + manifest_file_path);
 	}
 
 	// Step 2: Write the delta manifest list (Avro) natively, referencing the new manifest file.
@@ -395,33 +407,39 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 		PaimonAvroWriter::WriteFile(context, manifest_list_path, ManifestListSchemaJson(), {row});
 	}
 
-	// Get manifest list file size
+	// The delta manifest list must likewise be durable before the snapshot references it.
+	if (!fs.FileExists(manifest_list_path)) {
+		throw IOException("Paimon commit: manifest list was not written: " + manifest_list_path);
+	}
 	int64_t manifest_list_size = 0;
-	if (fs.FileExists(manifest_list_path)) {
+	{
 		auto handle = fs.OpenFile(manifest_list_path, FileFlags::FILE_FLAGS_READ);
 		manifest_list_size = handle->GetFileSize();
 	}
 
 	// Determine the next snapshot id from the LATEST hint (bare id, with legacy "snapshot-N" tolerated).
+	// A LATEST that exists but does not parse means the table is corrupt — fail loudly rather than
+	// silently resetting to id 1 (which would clobber snapshot-1 or commit on top of stale state).
 	int64_t next_snapshot_id = 1;
 	string latest_file = table_path + "/snapshot/LATEST";
 	if (fs.FileExists(latest_file)) {
-		try {
-			auto handle = fs.OpenFile(latest_file, FileFlags::FILE_FLAGS_READ);
-			auto file_size = handle->GetFileSize();
-			string content(file_size, '\0');
-			handle->Read(&content[0], file_size);
-			StringUtil::Trim(content);
-			if (StringUtil::StartsWith(content, "snapshot-")) {
-				content = content.substr(9);
-			}
-			if (!content.empty()) {
+		auto handle = fs.OpenFile(latest_file, FileFlags::FILE_FLAGS_READ);
+		auto file_size = handle->GetFileSize();
+		string content(file_size, '\0');
+		handle->Read(&content[0], file_size);
+		StringUtil::Trim(content);
+		if (StringUtil::StartsWith(content, "snapshot-")) {
+			content = content.substr(9);
+		}
+		if (!content.empty()) {
+			try {
 				next_snapshot_id = std::stoll(content) + 1;
+			} catch (const std::exception &e) {
+				throw IOException("Paimon commit: LATEST hint is not a valid snapshot id: '" + content + "'");
 			}
-		} catch (...) {
-			// If we can't read LATEST, start at 1
 		}
 	}
+	int64_t prev_snapshot_id = next_snapshot_id - 1;
 
 	// Step 2b: Write the BASE manifest list = all manifests carried forward from the previous snapshot
 	// (its base + delta). Without this, each commit would only expose its own delta and prior data
@@ -511,10 +529,22 @@ void PaimonInsert::CommitWrittenFiles(ClientContext &context, const string &tabl
 
 	// The snapshot file is the atomic commit point: FILE_CREATE_NEW fails if another writer already
 	// committed this id, so two concurrent commits can't clobber each other.
+	D_ASSERT(next_snapshot_id > prev_snapshot_id);
 	string snapshot_path = path_factory.snapshotFilePath(next_snapshot_id);
 	{
 		auto handle = fs.OpenFile(snapshot_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 		handle->Write((void *)snapshot_json.c_str(), snapshot_json.size());
+	}
+
+	// Durability barrier: the snapshot must be fully on disk before LATEST is advanced to it. Otherwise
+	// a partial snapshot write followed by the LATEST flip leaves readers pointing at a truncated
+	// snapshot — catalog corruption. Re-open and verify the byte count matches what we wrote.
+	{
+		auto handle = fs.OpenFile(snapshot_path, FileFlags::FILE_FLAGS_READ);
+		if (handle->GetFileSize() != (int64_t)snapshot_json.size()) {
+			throw IOException("Paimon commit: snapshot-" + std::to_string(next_snapshot_id) +
+			                  " was not fully written; refusing to advance LATEST");
+		}
 	}
 
 	// Step 5: Update the LATEST hint atomically (write a temp file, then rename over it) so a reader

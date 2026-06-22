@@ -110,8 +110,15 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 	}
 	string schema_0_json = CreateSchemaJson(schema, 0);
 	string schema_path = schema_dir + "/schema-" + std::to_string(schema.id);
-	auto schema_handle = fs.OpenFile(schema_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
-	schema_handle->Write((void *)schema_0_json.c_str(), schema_0_json.size());
+	{
+		auto schema_handle =
+		    fs.OpenFile(schema_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+		schema_handle->Write((void *)schema_0_json.c_str(), schema_0_json.size());
+	}
+	// The schema file defines the table; without it the table is unreadable. Verify it landed.
+	if (!fs.FileExists(schema_path)) {
+		throw IOException("Paimon CREATE TABLE: schema file was not written: " + schema_path);
+	}
 
 	// Create empty table metadata
 	auto table_metadata = make_uniq<PaimonTableMetadata>();
